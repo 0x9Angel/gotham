@@ -1,0 +1,61 @@
+# gotham-relay systemd unit
+#
+# Drop into /etc/systemd/system/gotham-relay.service and edit the User /
+# ExecStart paths to match the target host. Sandboxing flags assume
+# systemd ≥ 247.
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now gotham-relay
+#   sudo journalctl -u gotham-relay -f
+
+[Unit]
+Description=Gotham mixnet relay
+Documentation=https://gotham-protocol.org/docs/relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gotham
+Group=gotham
+WorkingDirectory=/var/lib/gotham-relay
+ExecStart=/usr/local/bin/gotham-relay run \
+  --key-file /var/lib/gotham-relay/identity.key \
+  --listen-port 443 \
+  --delay-micros 20000 \
+  --replay-size 1000000 \
+  --replay-ttl-secs 300
+
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+# ── Hardening (sandbox the process) ───────────────────────────────────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @debug @raw-io @reboot @swap @cpu-emulation
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ReadWritePaths=/var/lib/gotham-relay
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

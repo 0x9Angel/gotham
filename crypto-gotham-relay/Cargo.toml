@@ -1,0 +1,58 @@
+[package]
+name = "crypto-gotham-relay"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial"
+description = "Standalone Gotham mixnet relay daemon"
+authors = ["0x9Angel"]
+
+[[bin]]
+name = "gotham-relay"
+path = "src/main.rs"
+
+[dependencies]
+crypto-gotham = { path = "../crypto-gotham" }
+crypto-gotham-directory = { path = "../crypto-gotham-directory" }
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+
+# CLI + config
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+# Logging (counters-only — never per-packet data, never IPs)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Directory auto-enrollment — POST self-enrollment + heartbeat to the authority.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Crypto + utils
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+rand = "0.8"
+rand_chacha = "0.3"
+hex = "0.4"
+zeroize = { version = "1", features = ["derive"] }
+
+# Errors
+thiserror = "1"
+
+# NAT traversal — UPnP-IGD auto port-mapping so a volunteer behind a home
+# router is reachable without hand-configuring a port-forward.
+igd-next = { version = "0.15", features = ["aio_tokio"] }
+
+# Transport — QUIC + Noise XK
+quinn = "0.11"
+snow = "0.9"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+futures = "0.3"
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "test-util"] }

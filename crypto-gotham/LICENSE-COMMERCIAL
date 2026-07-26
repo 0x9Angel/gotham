@@ -1,0 +1,34 @@
+                  COMMERCIAL LICENSE (placeholder draft)
+
+This software is offered under a commercial license alongside the
+GNU Affero General Public License v3.0 (see LICENSE-AGPL).
+
+The commercial license is intended for:
+
+  - Organizations that operate Gotham relays in a proprietary
+    infrastructure and cannot comply with AGPLv3 source-disclosure
+    requirements (corporate or governmental settings).
+
+  - Vendors who embed the Gotham protocol implementation in proprietary
+    products distributed to end users.
+
+  - Integrators bundling Gotham within larger commercial offerings.
+
+The final commercial-license text is being drafted. Until the formal
+document is published, the project maintains the AGPLv3 as the sole
+publicly-available license. To enter into commercial-license discussions
+ahead of formal publication, contact:
+
+   crypto.app.organisation@proton.me
+
+The commercial license, once published, will:
+
+  - Grant the licensee the right to redistribute Gotham without the
+    AGPLv3 source-disclosure obligations.
+  - Preserve all end-to-end confidentiality, post-quantum, and anonymity
+    guarantees of the protocol — no relaxation of cryptographic
+    requirements is permitted.
+  - Include support, security-update, and incident-response terms
+    appropriate to enterprise and defense customers.
+
+— 0x9Angel, 2026-05-23

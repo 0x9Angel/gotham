@@ -1,0 +1,47 @@
+[package]
+name = "crypto-gotham-authority"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial"
+description = "Gotham directory authority — collects relay self-enrollments and serves an authority-signed directory"
+
+[[bin]]
+name = "gotham-directory-authority"
+path = "src/main.rs"
+
+[dependencies]
+crypto-gotham = { path = "../crypto-gotham" }
+# Reuses the relay's QUIC + Noise-XK initiator to probe enrollees for
+# liveness + proof-of-possession before listing them.
+crypto-gotham-relay = { path = "../crypto-gotham-relay" }
+# k-of-n admission attestations (AdmissionCert / Attestation) + shared HTTP wire
+# types served at /enroll (EnrollResponse) and /admissions (AdmissionEntry).
+crypto-gotham-directory = { path = "../crypto-gotham-directory" }
+rand = "0.8"
+
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+ed25519-dalek = { version = "2" }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hex = "0.4"
+# Ephemeral TURN credentials (coturn `use-auth-secret` REST format):
+# credential = base64(HMAC-SHA1(shared-secret, username)). SHA-1 is mandated by
+# the coturn REST scheme; it is used only as a short-lived-credential MAC here,
+# not for any collision-sensitive purpose.
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Drive the real axum handlers in-process (Router::oneshot) for the k-of-n
+# end-to-end test — no sockets, no spawned processes.
+tower = { version = "0.5", features = ["util"] }

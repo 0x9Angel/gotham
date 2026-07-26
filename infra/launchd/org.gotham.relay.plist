@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Reference launchd LaunchDaemon for a Gotham mixnet relay on macOS.
+     install-relay-macos.sh writes the real file to
+     /Library/LaunchDaemons/org.gotham.relay.plist with the @PLACEHOLDER@
+     tokens below substituted. Shipped for transparency (mirrors the Linux
+     systemd unit infra/systemd/crypto-gotham-relay.service). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>org.gotham.relay</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/local/bin/gotham-relay</string><string>run</string>
+    <string>--key-file</string><string>/usr/local/var/gotham-relay/relay.key</string>
+    <string>--listen-host</string><string>0.0.0.0</string>
+    <string>--listen-port</string><string>@PORT@</string>
+    <string>--authority-url</string><string>@AUTHORITY_URL@</string>
+    <string>--advertise-addr</string><string>@ADVERTISE_ADDR@</string>
+    <string>--enroll-token</string><string>@ENROLL_TOKEN@</string>
+    <string>--tier</string><string>@TIER@</string>
+    <string>--heartbeat-secs</string><string>60</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/usr/local/var/gotham-relay/relay.log</string>
+  <key>StandardErrorPath</key><string>/usr/local/var/gotham-relay/relay.log</string>
+</dict></plist>

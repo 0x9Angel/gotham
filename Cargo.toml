@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crypto-gotham",
+    "crypto-gotham-directory",
+    "crypto-gotham-relay",
+    "crypto-gotham-authority",
+]
+
+# Reproducible-build profile. Pins codegen-units = 1 (no parallel-scheduling
+# nondeterminism), strips symbols, disables rpath embedding (absolute paths
+# leak the builder's $HOME otherwise), and forces LTO so the link step
+# doesn't sample fresh randomness.
+#
+# `panic = "abort"` is deliberate and load-bearing for the threat model: a relay
+# processes hostile packets from the network, so a reachable panic is a remote
+# denial of service rather than a caught error. Aborting makes that failure mode
+# loud instead of silently degraded, and the test suite is written on that basis.
+[profile.release]
+codegen-units = 1
+lto = "fat"
+strip = "symbols"
+panic = "abort"
+incremental = false
+debug = false
+opt-level = 3
+rpath = false

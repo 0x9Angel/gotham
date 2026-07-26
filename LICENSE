@@ -1,0 +1,82 @@
+                    GNU AFFERO GENERAL PUBLIC LICENSE
+                       Version 3, 19 November 2007
+
+ Copyright (C) 2026 0x9Angel
+
+ Everyone is permitted to copy and distribute verbatim copies of this
+ license document, but changing it is not allowed.
+
+================================================================================
+ SCOPE
+================================================================================
+
+This AGPL-3.0 license applies ONLY to the Gotham mixnet crates:
+
+    crypto-gotham             (protocol library)
+    crypto-gotham-relay       (relay daemon)
+    crypto-gotham-directory   (directory data model)
+    crypto-gotham-authority   (directory authority server)
+
+Each is dual-licensed. Its per-file SPDX header reads:
+
+    SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial
+
+You may use these crates under EITHER the AGPL-3.0-or-later (this file) OR the
+commercial license (see LICENSE-COMMERCIAL.md), at your choice.
+
+The Crypto application (crypto-proto, crypto-agent, crypto-store, crypto-tests,
+crypto-enterprise, crypto-licensor, crypto-admin, crypto-tauri) is NOT under
+the AGPL — it is proprietary. See LICENSE and LICENSE-PROPRIETARY.md.
+
+================================================================================
+ KEY CONSEQUENCE OF THE AGPL (network-use / "SaaS" clause)
+================================================================================
+
+The AGPLv3 differs from the GPLv3 in one decisive way: running a MODIFIED
+version of the program to provide a service over a network counts as
+"conveying" it. Concretely, if you operate a modified Gotham relay, directory,
+or authority as a network service, you MUST offer the users of that service the
+complete corresponding source code of your modified version, under the AGPLv3.
+
+Running the UNMODIFIED official binaries imposes no source-disclosure
+obligation on you — you are simply running the program.
+
+================================================================================
+ FULL LICENSE TEXT
+================================================================================
+
+This project distributes the GNU Affero General Public License v3.0 by
+reference. The complete, canonical, verbatim license text is published by the
+Free Software Foundation at:
+
+    https://www.gnu.org/licenses/agpl-3.0.txt   (plain text)
+    https://www.gnu.org/licenses/agpl-3.0.html  (HTML)
+
+The SPDX-registered identifier for this license is `AGPL-3.0-or-later`; the
+canonical text for that identifier is authoritative and governs, exactly as if
+reproduced here in full. When network access permits, a verbatim copy of that
+text should be vendored into this file in place of this reference block; until
+then the FSF-published text at the URL above is the governing text.
+
+================================================================================
+ HOW TO APPLY THE AGPL TO A DERIVED WORK
+================================================================================
+
+If you fork the Gotham crates, keep the SPDX headers, keep this file, and add
+your own copyright line below the existing one. The standard per-file notice is:
+
+    <one line to give the program's name and a brief idea of what it does.>
+    Copyright (C) <year>  <name of author>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Affero General Public License as published
+    by the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Affero General Public License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.

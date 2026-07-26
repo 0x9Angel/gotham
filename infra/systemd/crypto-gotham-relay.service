@@ -1,0 +1,66 @@
+[Unit]
+Description=Gotham mixnet relay (Crypto project)
+Documentation=https://github.com/0x9Angel/gotham-relay#readme
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gotham
+Group=gotham
+WorkingDirectory=/opt/gotham
+# Config (port, authority URL, advertise addr, tier, token, optional
+# country/operator) is written to relay.env by install-relay.sh. The relay
+# reads GOTHAM_ENROLL_TOKEN from the environment; the rest are passed as flags.
+# Note: $GOTHAM_EXTRA_ARGS uses no braces on purpose so systemd word-splits it
+# into separate optional flags (--country / --operator); empty = no extra flags.
+EnvironmentFile=/etc/gotham/relay.env
+ExecStart=/opt/gotham/bin/gotham-relay run \
+    --key-file /opt/gotham/state/relay.key \
+    --listen-port ${GOTHAM_PORT} \
+    --authority-url ${GOTHAM_AUTHORITY_URL} \
+    --advertise-addr ${GOTHAM_ADVERTISE_ADDR} \
+    --tier ${GOTHAM_TIER} \
+    --delay-micros 20000 \
+    --replay-size 1000000 \
+    --replay-ttl-secs 300 \
+    $GOTHAM_EXTRA_ARGS
+Restart=always
+RestartSec=5
+StartLimitInterval=200
+StartLimitBurst=5
+
+# ─── Hardening ──────────────────────────────────────────────────────────
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ReadWritePaths=/opt/gotham/state /var/log/gotham
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Resource limits — kept generous for a 1-OCPU Ampere A1.
+LimitNOFILE=65536
+TasksMax=4096
+
+# Logging — counters only, never per-packet data, never IPs.
+Environment="RUST_LOG=info,crypto_gotham_relay=info"
+StandardOutput=append:/var/log/gotham/relay.log
+StandardError=append:/var/log/gotham/relay.err
+
+[Install]
+WantedBy=multi-user.target

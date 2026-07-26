@@ -1,0 +1,70 @@
+# gotham-directory-authority systemd unit
+#
+# Drop into /etc/systemd/system/gotham-directory-authority.service and edit the
+# paths / token to match the host. Sandboxing flags assume systemd >= 247.
+#
+#   # one-time setup
+#   sudo useradd -r -s /usr/sbin/nologin -d /var/lib/gotham-authority gotham-auth
+#   sudo mkdir -p /var/lib/gotham-authority
+#   sudo install -m700 -o gotham-auth -g gotham-auth -d /var/lib/gotham-authority
+#   # generate the authority signing key (PRINT + KEEP the public key for the app)
+#   head -c 32 /dev/urandom | xxd -p -c 32 | sudo tee /var/lib/gotham-authority/authority.seed >/dev/null
+#   sudo chown gotham-auth:gotham-auth /var/lib/gotham-authority/authority.seed
+#   sudo chmod 600 /var/lib/gotham-authority/authority.seed
+#   # set an enroll token for the closed test
+#   echo "GOTHAM_ENROLL_TOKEN=$(head -c 24 /dev/urandom | xxd -p)" | sudo tee /var/lib/gotham-authority/env >/dev/null
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now gotham-directory-authority
+#   sudo journalctl -u gotham-directory-authority -f   # logs the authority PUBLIC key to pin in the app
+#
+# Put a TLS reverse proxy (caddy / nginx) in front so relays + apps reach it at
+# https://dir.example.org.
+
+[Unit]
+Description=Gotham directory authority (auto-enrollment + signed directory)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gotham-auth
+Group=gotham-auth
+WorkingDirectory=/var/lib/gotham-authority
+EnvironmentFile=/var/lib/gotham-authority/env
+ExecStart=/usr/local/bin/gotham-directory-authority \
+  --authority-key /var/lib/gotham-authority/authority.seed \
+  --listen 127.0.0.1:8443 \
+  --valid-secs 3600
+
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+# ── Hardening ─────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @debug @raw-io @reboot @swap @cpu-emulation
+ReadWritePaths=/var/lib/gotham-authority
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

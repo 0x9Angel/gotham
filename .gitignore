@@ -1,0 +1,43 @@
+# Rust build output
+target/
+**/target/
+
+# Node.js
+node_modules/
+crypto-tauri/dist/
+
+# Base de données locale
+*.db
+*.db-shm
+*.db-wal
+
+# Environnement
+.env
+
+# Build artifacts locaux
+pkgbuild/*.AppImage
+pkgbuild/*.pkg.tar.zst
+pkgbuild/pkg/
+pkgbuild/src/
+
+# Bundled binaries (downloaded by scripts/download-deps.sh — not committed)
+crypto-tauri/src-tauri/resources/tor-linux/*
+crypto-tauri/src-tauri/resources/tor-macos/*
+crypto-tauri/src-tauri/resources/lokinet-linux/*
+crypto-tauri/src-tauri/resources/lokinet-macos/*
+!crypto-tauri/src-tauri/resources/**/.gitkeep
+
+# Operator signing keys — NEVER commit
+licensor.sk
+licensor.pk
+*.key
+*.pem
+
+
+# Audit export artefacts (user-generated, never commit)
+crypto-audit-*.jsonl
+crypto-audit-*.seal.json
+
+
+# Local Gotham testnet — relay/authority keys, logs, generated dirs. NEVER commit.
+.gotham-testnet/

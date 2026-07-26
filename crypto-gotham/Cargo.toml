@@ -1,0 +1,48 @@
+[package]
+name = "crypto-gotham"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial"
+description = "Gotham — low-latency PQ-hybrid mixnet protocol for the Crypto suite"
+authors = ["0x9Angel"]
+
+[dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+serde_json = "1"
+hex = "0.4"
+
+# Classical crypto
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["serde"] }
+curve25519-dalek = "4"
+chacha20poly1305 = "0.10"
+chacha20 = "0.9"
+poly1305 = "0.8"
+hkdf = "0.12"
+sha2 = "0.10"
+blake3 = "1"
+
+# Post-quantum (NIST FIPS 203 — ML-KEM-768)
+ml-kem = "0.2"
+
+# Random + secure memory
+rand = "0.8"
+rand_chacha = "0.3"
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+
+# Errors + utils
+thiserror = "1"
+bytes = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+hex = "0.4"
+proptest = "1"
+criterion = "0.5"
+
+[[bench]]
+name = "sphinx"
+harness = false
