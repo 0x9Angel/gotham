@@ -44,10 +44,20 @@ set -euo pipefail
 
 # ─── Config + defaults ──────────────────────────────────────────────────
 AUTHORITY_URL="${GOTHAM_AUTHORITY_URL:-http://144.24.205.188:8443}"
+# Clients admit a relay only when k of n authorities have attested it (k=2,
+# n=3 in the shipped app). Enrolling with the primary alone produced a relay
+# that ran, reported itself healthy, and was DROPPED by every client — the
+# installer even printed "LIVE and ENROLLED". Enrol with all three.
+EXTRA_AUTHORITY_URLS="${GOTHAM_EXTRA_AUTHORITY_URLS:-http://84.235.232.196:8443 http://84.235.228.107:8443}"
 TIER="${GOTHAM_TIER:-mix}"
 PORT="${GOTHAM_PORT:-443}"
 COUNTRY="${GOTHAM_COUNTRY:-}"
-OPERATOR="${GOTHAM_OPERATOR:-}"
+# Path selection refuses two hops it cannot PROVE belong to different
+# operators, so a relay with no label can never be part of a route. Defaults to
+# the hostname, which is at least stable and distinct per machine; operators
+# running several relays should set GOTHAM_OPERATOR to the same value on all of
+# them so diversity actually reflects who runs what.
+OPERATOR="${GOTHAM_OPERATOR:-$(hostname -s 2>/dev/null || hostname)}"
 ENROLL_TOKEN="${GOTHAM_ENROLL_TOKEN:-}"
 
 REPO="0x9Angel/gotham-relay"
@@ -108,7 +118,15 @@ ADVERTISE_IP="${GOTHAM_ADVERTISE_IP:-$(curl -fsSL --max-time 8 https://api.ipify
 
 EXTRA=""
 [[ -n "$COUNTRY"  ]] && EXTRA+=" --country $COUNTRY"
-[[ -n "$OPERATOR" ]] && EXTRA+=" --operator $OPERATOR"
+if [[ -z "$OPERATOR" ]]; then
+  echo "[!] No operator label could be determined and none was given."
+  echo "    A relay without one is never selected for a path. Set GOTHAM_OPERATOR."
+  exit 1
+fi
+EXTRA+=" --operator $OPERATOR"
+for u in $EXTRA_AUTHORITY_URLS; do
+  EXTRA+=" --extra-authority-url $u"
+done
 
 # Decide DIRECT (we have a reachable public address) vs RENDEZVOUS (RFC B3 —
 # behind CGNAT / mobile 4G-5G / broken UPnP: keep an OUTBOUND tunnel to a public
@@ -193,6 +211,20 @@ if [[ "$MODE" == "direct" ]]; then
 else
     echo "    Rendezvous mode: outbound-only, no inbound firewall rule needed."
 fi
+# Log rotation. Without it the relay appends forever and a flood of malformed
+# packets fills the disk, which stops the relay and often the whole VPS.
+LR_SRC=""
+for c in "$(dirname "$0")/../logrotate/gotham-relay" /tmp/crypto-src/infra/logrotate/gotham-relay; do
+    [[ -f "$c" ]] && LR_SRC="$c" && break
+done
+if [[ -n "$LR_SRC" ]]; then
+    install -m 0644 "$LR_SRC" /etc/logrotate.d/gotham-relay
+else
+    curl -fsSL "https://raw.githubusercontent.com/$REPO/main/infra/logrotate/gotham-relay" \
+        -o /etc/logrotate.d/gotham-relay 2>/dev/null || \
+        echo "    (could not install logrotate config — rotate /var/log/gotham/relay.log yourself)"
+fi
+
 systemctl daemon-reload
 systemctl enable --now crypto-gotham-relay.service
 
@@ -204,11 +236,29 @@ echo "[7/7] Waiting for the authority to accept enrollment..."
 # rendezvous host and our reverse tunnel may not be registered there yet. Every
 # CGNAT volunteer was told the install had failed while it was in fact about to
 # succeed. The relay now retries that case within seconds; we just wait for it.
+# Count how many authorities list us. Clients admit a relay only when k of n
+# have attested it (k=2, n=3 today), so being in the primary's directory alone
+# means the relay runs, looks healthy, and is dropped by every client. The
+# installer used to print "LIVE and ENROLLED" for exactly that state.
+QUORUM_NEEDED="${GOTHAM_QUORUM_NEEDED:-2}"
+ALL_AUTHORITIES="$AUTHORITY_URL $EXTRA_AUTHORITY_URLS"
+
+count_attestations() {
+    local n=0
+    for a in $ALL_AUTHORITIES; do
+        local d
+        d="$(curl -fsSL --max-time 8 "$a/directory" 2>/dev/null || true)"
+        printf '%s' "$d" | grep -qi "$PUBKEY" && n=$((n + 1))
+    done
+    printf '%s' "$n"
+}
+
 ENROLLED=0
+SEEN_BY=0
 for _ in $(seq 1 20); do
     sleep 5
-    DIR="$(curl -fsSL --max-time 8 "$AUTHORITY_URL/directory" 2>/dev/null || true)"
-    if printf '%s' "$DIR" | grep -qi "$PUBKEY"; then ENROLLED=1; break; fi
+    SEEN_BY="$(count_attestations)"
+    if [[ "$SEEN_BY" -ge "$QUORUM_NEEDED" ]]; then ENROLLED=1; break; fi
     # Only a genuinely terminal failure aborts the wait.
     if grep -qi "invalid possession proof\|401 Unauthorized\|rejected: missing" "$LOG_DIR/relay.log" 2>/dev/null; then
         echo "    Authority refused this relay outright — see the cause below."
@@ -219,9 +269,14 @@ done
 echo
 echo "============================================================"
 if [[ "$ENROLLED" -eq 1 ]]; then
-    echo " Gotham relay is LIVE and ENROLLED"
+    echo " Gotham relay is LIVE and ENROLLED ($SEEN_BY/$QUORUM_NEEDED authorities)"
 else
-    echo " Gotham relay installed — enrollment NOT yet confirmed"
+    echo " Gotham relay installed — NOT usable by clients yet"
+    echo " Attested by $SEEN_BY of the $QUORUM_NEEDED authorities required."
+    if [[ "$SEEN_BY" -gt 0 ]]; then
+        echo " It IS running and one authority sees it, but clients need a quorum,"
+        echo " so no traffic will be routed through it until the others accept it."
+    fi
     if [[ "$MODE" == "direct" ]]; then
         echo " Most common cause: UDP port $PORT is not reachable from the internet"
         echo " (router port-forward missing, or CGNAT). The authority must reach"
@@ -240,6 +295,7 @@ else
     echo " Reachable  : via rendezvous ${R_ADDR:-?}   (tier: $TIER, CGNAT/B3)"
 fi
 echo " Authority  : $AUTHORITY_URL"
+echo " Operator   : $OPERATOR   (a relay without a label is never routed)"
 echo
 echo " Live logs  : tail -F $LOG_DIR/relay.log"
 echo " Status     : systemctl status crypto-gotham-relay.service"

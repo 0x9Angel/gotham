@@ -24,8 +24,7 @@
 # For Option B (self-operated testnet) the authority IS you; generate it once:
 #   cargo run -p crypto-gotham-relay --bin gotham-relay -- keygen --key-file ~/.gotham-authority.key
 # Then export its pubkey hex and hardcode it in
-# the application's pinned DEFAULT_AUTHORITY_PUBKEY (the app is not published
-# in this repository).
+# `crypto-tauri/src-tauri/src/gotham.rs:DEFAULT_AUTHORITY_PUBKEY` (TODO).
 
 set -euo pipefail
 

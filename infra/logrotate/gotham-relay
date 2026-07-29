@@ -1,0 +1,20 @@
+# Log rotation for the Gotham relay.
+#
+# The unit appends to this file for the life of the service and logs a warning
+# per malformed packet, so a host under a flood fills its disk. On the small
+# VPS a volunteer typically donates, that takes down the relay and everything
+# else on the machine with it.
+#
+# copytruncate rather than a reload: the relay holds the file open through
+# systemd's append redirection and has no log-reopen signal.
+/var/log/gotham/relay.log {
+    daily
+    rotate 7
+    maxsize 50M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root gotham-relay
+}

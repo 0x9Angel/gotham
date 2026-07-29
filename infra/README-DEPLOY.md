@@ -160,7 +160,7 @@ Two things need to happen:
 
 ### 6a — Pin the authority pubkey in the app source
 
-In the Crypto application (not published in this repository), find the constant
+Edit `crypto-tauri/src-tauri/src/gotham.rs` and find the constant
 `DEFAULT_AUTHORITY_PUBKEY` (TODO: this constant doesn't exist yet in
 Phase 0 of Option D — for now, the app uses `load_or_create_local_directory`
 which generates a per-install authority. Until that's wired, you have

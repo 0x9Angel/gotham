@@ -38,6 +38,18 @@ $Bin = Join-Path $Dir "gotham-relay.exe"
 $Key = Join-Path $Dir "relay.key"
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 
+# C:\ProgramData grants Users read by default and children inherit it, so the
+# relay's long-term secret was readable by every account on the machine — and
+# on a shared or multi-user host that is the whole identity of the relay.
+# Replace inheritance with an explicit ACL: SYSTEM and Administrators only.
+$Acl = Get-Acl $Dir
+$Acl.SetAccessRuleProtection($true, $false)   # break inheritance, drop inherited ACEs
+foreach ($who in @("NT AUTHORITY\SYSTEM", "BUILTIN\Administrators")) {
+    $Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $who, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
+}
+Set-Acl -Path $Dir -AclObject $Acl
+
 Write-Host "[1/5] Downloading + verifying binary..."
 $Asset = "gotham-relay-windows-x86_64.exe"
 $Base  = "https://github.com/$Repo/releases/latest/download"

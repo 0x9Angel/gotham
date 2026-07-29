@@ -342,6 +342,20 @@ pub enum TransportError {
     /// (over-length handshake msg, bad packet size, …).
     #[error("malformed handshake message")]
     BadHandshake,
+    /// Nothing answered within the time budget.
+    ///
+    /// Separate from [`BadHandshake`] on purpose. Both liveness probes used to
+    /// report a timeout as a malformed handshake, which sends an operator
+    /// hunting for a protocol bug when the cause is almost always a closed UDP
+    /// port — a cloud security list, or a host firewall. That message cost an
+    /// afternoon once; on a network run by volunteers it costs people's
+    /// willingness to run a relay at all.
+    #[error(
+        "no response within {0:?} — nothing is reachable at that address. \
+         Check that the UDP port is open in your provider's firewall \
+         (cloud security list / security group), not only on the host itself."
+    )]
+    Unreachable(std::time::Duration),
 }
 
 // ─── Self-signed TLS cert (Noise XK provides real auth) ─────────────────────
@@ -802,7 +816,9 @@ pub async fn probe_rendezvous_hosting(
     };
     match tokio::time::timeout(timeout, fut).await {
         Ok(res) => res,
-        Err(_) => Err(TransportError::BadHandshake),
+        // Nothing came back at all. Reporting that as a handshake failure names
+        // the symptom this code saw, not the cause the operator has to fix.
+        Err(_) => Err(TransportError::Unreachable(timeout)),
     }
 }
 
@@ -839,7 +855,9 @@ pub async fn probe_relay_liveness(
     };
     match tokio::time::timeout(timeout, fut).await {
         Ok(res) => res,
-        Err(_) => Err(TransportError::BadHandshake),
+        // Nothing came back at all. Reporting that as a handshake failure names
+        // the symptom this code saw, not the cause the operator has to fix.
+        Err(_) => Err(TransportError::Unreachable(timeout)),
     }
 }
 
@@ -1640,6 +1658,40 @@ pub async fn serve_endpoint_with_services(
 
 #[cfg(test)]
 mod tests {
+    /// A closed UDP port must be reported as unreachable, not as a protocol
+    /// fault. This exact confusion cost an afternoon: the authority answered
+    /// "malformed handshake message" for a relay whose provider firewall was
+    /// dropping the packets, which points an operator at the wrong thing
+    /// entirely. The message has to name the firewall.
+    #[tokio::test]
+    async fn an_unreachable_relay_says_so_instead_of_blaming_the_handshake() {
+        // TEST-NET-1 (RFC 5737) — reserved for documentation, never routed, so
+        // this cannot reach a real host or depend on the network.
+        let addr: std::net::SocketAddr = "192.0.2.1:9102".parse().unwrap();
+        let err = super::probe_relay_liveness(
+            addr,
+            &[0u8; 32],
+            &[1u8; 32],
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .expect_err("a black-holed address cannot be probed");
+
+        assert!(
+            matches!(err, super::TransportError::Unreachable(_)),
+            "expected Unreachable, got {err:?}",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("firewall"),
+            "must point at the firewall: {msg}"
+        );
+        assert!(
+            !msg.contains("handshake"),
+            "must not send the operator hunting for a protocol bug: {msg}",
+        );
+    }
+
     use super::*;
     use crypto_gotham::header::{
         derive_route_secrets, flag, mode, wrap_header, RoutingRecord, HEADER_LEN, TRAILER_LEN,

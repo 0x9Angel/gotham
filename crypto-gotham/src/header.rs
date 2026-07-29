@@ -2,9 +2,9 @@
 // Copyright (C) 2026 0x9Angel.
 // See LICENSE-AGPL and LICENSE-COMMERCIAL in this crate's root.
 
-//! Sphinx-style header — v0.1 slot-based design.
+//! Sphinx-style header — v0.2 slot-based design.
 //!
-//! ## Design choices (v0.1)
+//! ## Design choices
 //!
 //! **X25519-only per-hop key agreement.** The ML-KEM-768 hybrid (see
 //! [`crate::hybrid`]) is reserved for the application-layer end-to-end
@@ -13,9 +13,18 @@
 //! **Slot-based routing block.** β is organised as [`MAX_HOPS`] fixed
 //! 64-byte slots; each hop's record sits at offset `hop_index * 64`. We
 //! ship a 1-byte `hop_index` field in the header — it leaks the hop's
-//! position in the chain (bounded by `MAX_HOPS = 5`). v0.2 will replace
-//! this with the classical Sphinx shift-and-pad construction once we have
-//! battle-tested the simpler version.
+//! position in the chain (bounded by `MAX_HOPS = 5`).
+//!
+//! **β and the trailer are re-randomised at every hop (v0.2).** Each relay
+//! XORs the whole of β‖trailer with ChaCha20(`k_shuffle`) before forwarding,
+//! and the sender pre-compensates so each hop still finds its own slot. v0.1
+//! forwarded both verbatim, which left 332 of the header's 384 bytes constant
+//! from the first link to the last: two relays anywhere on one path could join
+//! their logs on those bytes and tie the sender's address to the recipient
+//! with certainty, from a single packet, with no timing analysis. That is the
+//! one property a mixnet exists to provide, so it is enforced by
+//! `every_hop_emits_a_binarily_different_header` over every PAIR of hops —
+//! the colluding relays need not be adjacent.
 //!
 //! **Per-slot independent ChaCha20 streams.** Each slot is XOR'd with the
 //! relevant hop's ChaCha20(k_header) keystream. Unlinkability of slots
@@ -81,7 +90,15 @@ pub const MAX_HOPS: usize = BETA_LEN / RECORD_LEN;
 const _: () = assert!(MAX_HOPS == 5);
 
 /// Header version byte.
-pub const VERSION: u8 = 1;
+/// Wire version of the Sphinx header.
+///
+/// Bumped to 2 when β and the trailer started being re-randomised at every hop.
+/// The change is NOT backward compatible: a v1 relay forwards β verbatim, so a
+/// v2 sender's pre-compensation would desynchronise and every downstream hop
+/// would fail its MAC check. Rejecting on the version byte turns that into one
+/// clear error at the first hop instead of an unexplained BadMac in the middle
+/// of the path. Relays and clients must be rolled out together.
+pub const VERSION: u8 = 2;
 
 /// Anonymity modes (numeric values stable across versions).
 pub mod mode {
@@ -320,6 +337,17 @@ pub struct HopSubKeys {
     pub k_payload: [u8; 32],
     /// Scalar used to re-blind α to the next hop.
     pub k_blind: [u8; 32],
+    /// ChaCha20 key that re-randomises the WHOLE of β and the trailer on the
+    /// way out of this hop.
+    ///
+    /// Without it, β (320 B) and the trailer (12 B) travelled byte-identical
+    /// from the first hop to the last — 332 of the header's 384 bytes were a
+    /// per-packet fingerprint. Two relays on one path (the adversary a mixnet
+    /// exists to defeat, and one that costs two cheap VPS) could join their
+    /// logs on those bytes and link sender to recipient with certainty, from a
+    /// single packet, with no timing analysis. α was already re-blinded and γ
+    /// already replaced per hop, so this was the last invariant.
+    pub k_shuffle: [u8; 32],
 }
 
 /// Derive per-hop sub-keys from a 32-byte X25519 shared secret via HKDF-SHA256.
@@ -336,7 +364,7 @@ pub fn derive_hop_subkeys(shared_x: &[u8; 32]) -> Result<HopSubKeys> {
         ));
     }
     let hk = hkdf::Hkdf::<Sha256>::new(Some(SUBKEY_SALT), shared_x);
-    let mut buf = [0u8; 32 * 4];
+    let mut buf = [0u8; 32 * 5];
     hk.expand(SUBKEY_INFO, &mut buf)
         .map_err(|_| Error::Crypto("HKDF expand hop sub-keys"))?;
     let mut sub = HopSubKeys {
@@ -344,11 +372,13 @@ pub fn derive_hop_subkeys(shared_x: &[u8; 32]) -> Result<HopSubKeys> {
         k_header: [0; 32],
         k_payload: [0; 32],
         k_blind: [0; 32],
+        k_shuffle: [0; 32],
     };
     sub.k_mac.copy_from_slice(&buf[0..32]);
     sub.k_header.copy_from_slice(&buf[32..64]);
     sub.k_payload.copy_from_slice(&buf[64..96]);
     sub.k_blind.copy_from_slice(&buf[96..128]);
+    sub.k_shuffle.copy_from_slice(&buf[128..160]);
     Ok(sub)
 }
 
@@ -484,12 +514,38 @@ pub fn wrap_header<R: CryptoRng + RngCore>(
         return Err(Error::Routing("alphas / records length mismatch"));
     }
 
-    // ── 1. Initialize β with random bytes for ALL slots ──────────────────
+    // ── 1. Per-hop shuffle prefixes ──────────────────────────────────────
+    //
+    // Hop i XORs the whole of β‖trailer with its own keystream on the way out,
+    // so the bytes on the wire differ on every link. What hop i SEES is
+    // therefore the packet the sender built, XORed with every earlier hop's
+    // stream:
+    //
+    //     view_i = view_0 XOR S_0 XOR … XOR S_{i-1}   (prefix_i below)
+    //
+    // The sender knows every hop key, so it pre-compensates: writing
+    // `slot_i XOR prefix_i[slot_i]` into view_0 makes hop i decrypt exactly the
+    // record intended for it. prefix_0 is all-zero, i.e. the first hop sees the
+    // header verbatim.
+    let shuffles: Vec<Vec<u8>> = sub_keys
+        .iter()
+        .map(|k| chacha20_stream(&k.k_shuffle, BETA_LEN + TRAILER_LEN))
+        .collect();
+    let mut prefixes: Vec<Vec<u8>> = Vec::with_capacity(n);
+    let mut acc = vec![0u8; BETA_LEN + TRAILER_LEN];
+    for sh in shuffles.iter().take(n) {
+        prefixes.push(acc.clone());
+        for (a, s) in acc.iter_mut().zip(sh.iter()) {
+            *a ^= *s;
+        }
+    }
+
+    // ── 2. Initialize β with random bytes for ALL slots ──────────────────
     //      (real records overwrite slots 0..n; slots n..MAX_HOPS stay random)
     let mut beta = [0u8; BETA_LEN];
     rng.fill_bytes(&mut beta);
 
-    // ── 2. Encrypt slot[i] for each hop, computing γ chain inside-out ───
+    // ── 3. Encrypt slot[i] for each hop, computing γ chain inside-out ───
     //      (γ for the last hop first, then propagate into next_gamma fields)
     let mut next_gamma = [0u8; GAMMA_LEN];
 
@@ -503,26 +559,37 @@ pub fn wrap_header<R: CryptoRng + RngCore>(
         let stream = chacha20_stream(&sub_keys[i].k_header, RECORD_LEN);
         let offset = i * RECORD_LEN;
         for j in 0..RECORD_LEN {
-            beta[offset + j] = record_bytes[j] ^ stream[j];
+            // …XOR prefixes[i] so that after the earlier hops have shuffled,
+            // hop i reads `record_bytes ^ stream` at its own offset.
+            beta[offset + j] = record_bytes[j] ^ stream[j] ^ prefixes[i][offset + j];
         }
 
-        // Compute γ_i over (meta || α_i || β[slot_i] || trailer).
-        // β[slot_i] is the freshly-encrypted slot we just wrote. Subsequent
-        // iterations modifying other slots will NOT invalidate this γ.
+        // γ_i authenticates the header AS HOP i WILL SEE IT, so the MAC input
+        // uses that hop's view of its slot and of the trailer, not the bytes
+        // the sender happens to hold.
+        let mut seen_beta = beta;
+        for (j, b) in seen_beta.iter_mut().enumerate() {
+            *b ^= prefixes[i][j];
+        }
+        let mut seen_trailer = trailer;
+        for (j, t) in seen_trailer.iter_mut().enumerate() {
+            *t ^= prefixes[i][BETA_LEN + j];
+        }
         let candidate = Header {
             version: VERSION,
             mode,
             hop_count: n as u8,
             hop_index: i as u8,
             alpha: alphas[i],
-            beta,
+            beta: seen_beta,
             gamma: [0; GAMMA_LEN], // not part of MAC input
-            trailer,
+            trailer: seen_trailer,
         };
         next_gamma = poly1305_tag(&sub_keys[i].k_mac, &candidate.mac_input_for_slot(i));
     }
 
     // After the loop, next_gamma holds γ_0 — the MAC for the first hop.
+    // prefix_0 is zero, so the emitted β and trailer are hop 0's view already.
     Ok(Header {
         version: VERSION,
         mode,
@@ -573,17 +640,32 @@ pub fn unwrap_header(header: &Header, sub_keys: &HopSubKeys) -> Result<UnwrapOut
     }
     let record = RoutingRecord::decode(&record_bytes);
 
-    // 3. Build next header
+    // 3. Build next header.
+    //
+    // Re-randomise the WHOLE of β and the trailer. Forwarding them verbatim
+    // (what v0.1 did) left 332 of 384 header bytes constant end to end, which
+    // any two relays on the path could join on to link sender and recipient
+    // deterministically. The sender pre-compensated for this stream, so the
+    // next hop still finds its own slot where it expects it.
     let next_alpha = blind_alpha(&header.alpha, &sub_keys.k_blind);
+    let shuffle = chacha20_stream(&sub_keys.k_shuffle, BETA_LEN + TRAILER_LEN);
+    let mut next_beta = header.beta;
+    for (j, b) in next_beta.iter_mut().enumerate() {
+        *b ^= shuffle[j];
+    }
+    let mut next_trailer = header.trailer;
+    for (j, t) in next_trailer.iter_mut().enumerate() {
+        *t ^= shuffle[BETA_LEN + j];
+    }
     let next_header = Header {
         version: header.version,
         mode: header.mode,
         hop_count: header.hop_count,
         hop_index: header.hop_index.saturating_add(1),
         alpha: next_alpha,
-        beta: header.beta, // β unchanged across hops in v0.1 slot-based design
+        beta: next_beta,
         gamma: record.next_gamma,
-        trailer: header.trailer,
+        trailer: next_trailer,
     };
 
     Ok(UnwrapOutcome {
@@ -755,6 +837,72 @@ mod tests {
                 assert!(outcome.record.is_last_hop(), "last hop flag missing");
             } else {
                 header = outcome.next_header;
+            }
+        }
+    }
+
+    /// The header a relay forwards must share NO constant bytes with the one it
+    /// received, on any link of the path.
+    ///
+    /// v0.1 forwarded β and the trailer verbatim (`beta: header.beta`), so 332
+    /// of the header's 384 bytes were a per-packet fingerprint that survived
+    /// the whole route. Two relays anywhere on one path — the adversary a
+    /// mixnet exists to defeat — could join their logs on those bytes and tie
+    /// the sender's IP to the recipient with certainty, from a single packet.
+    /// No test asserted the header changed, which is exactly why it shipped.
+    #[test]
+    fn every_hop_emits_a_binarily_different_header() {
+        for n in 2..=MAX_HOPS {
+            let mut r = rng();
+            let relays = fake_relays(&mut r, n);
+            let pks: Vec<[u8; 32]> = relays.iter().map(|(_, pk)| *pk).collect();
+            let (alphas, sub_keys) = derive_route_secrets(&mut r, &pks).unwrap();
+            let records: Vec<RoutingRecord> =
+                (0..n).map(|i| sample_record(i, i + 1 == n)).collect();
+            let mut trailer = [0u8; TRAILER_LEN];
+            r.fill_bytes(&mut trailer);
+
+            let mut header = wrap_header(
+                &mut r,
+                mode::BALANCED,
+                &alphas,
+                &sub_keys,
+                &records,
+                trailer,
+            )
+            .unwrap();
+
+            // What each relay on the path actually observes.
+            let mut seen_beta: Vec<[u8; BETA_LEN]> = Vec::new();
+            let mut seen_trailer: Vec<[u8; TRAILER_LEN]> = Vec::new();
+
+            for (i, (sk, _pk)) in relays.iter().enumerate() {
+                seen_beta.push(header.beta);
+                seen_trailer.push(header.trailer);
+                let shared = sk.diffie_hellman(&X25519PublicKey::from(header.alpha));
+                let hop_sub = derive_hop_subkeys(shared.as_bytes()).unwrap();
+                let outcome = unwrap_header(&header, &hop_sub).unwrap();
+                if i + 1 < n {
+                    header = outcome.next_header;
+                }
+            }
+
+            // No two hops may share β or the trailer. Checked over EVERY pair,
+            // not just consecutive ones: the attack only needs two colluding
+            // relays, and they need not be adjacent — entry and exit is the
+            // worst case and the easiest to arrange.
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    assert_ne!(
+                        seen_beta[a], seen_beta[b],
+                        "n={n}: β identical between hop {a} and hop {b} — the packet is \
+                         linkable end to end by two colluding relays"
+                    );
+                    assert_ne!(
+                        seen_trailer[a], seen_trailer[b],
+                        "n={n}: trailer identical between hop {a} and hop {b}"
+                    );
+                }
             }
         }
     }

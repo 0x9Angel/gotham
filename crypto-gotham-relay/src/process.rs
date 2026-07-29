@@ -240,9 +240,14 @@ impl Relay {
         // The payload region carries one LIONESS layer per hop (applied by the
         // sender). Decrypting our layer both reveals the original bytes for the
         // exit AND — on a forwarded packet — transforms what the next link
-        // carries. LIONESS is a non-malleable wide-block PRP, so no operator can
-        // byte-match, or tag-and-track, the same flow across two points of the
-        // path. Content stays end-to-end encrypted; this defends linkability.
+        // carries, so the payload cannot be byte-matched across two points of
+        // the path. Content stays end-to-end encrypted.
+        //
+        // This comment used to claim the stronger "no operator can byte-match
+        // the same flow across two points of the path", which was false while
+        // it was written: the payload was hardened, but the HEADER forwarded β
+        // and the trailer verbatim, leaving 332 constant bytes to match on.
+        // Unlinkability needs BOTH halves — see header.rs, wire version 2.
         let mut payload_region = packet_bytes[HEADER_LEN..].to_vec();
         crypto_gotham::lioness::decrypt(&sub_keys.k_payload, &mut payload_region);
 

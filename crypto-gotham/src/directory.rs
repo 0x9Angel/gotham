@@ -686,18 +686,25 @@ fn path_diverse(existing: &[&RelayDescriptor], cand: &RelayDescriptor, by_id: &I
 /// rendezvous-hosted relays are compared on their rendezvous relay's network
 /// position (see [`eff_diversity_ip`]).
 fn pair_diverse(a: &RelayDescriptor, b: &RelayDescriptor, by_id: &IdIndex) -> bool {
-    // Operator diversity (only enforced if BOTH have an operator set).
+    // Operator diversity, FAIL CLOSED.
     //
-    // RESIDUAL LIMITATION: gossip-admitted relays carry `operator: None` (the
-    // self-signed advertisement has no operator field), so on the self-forming
-    // network this check is inert and network diversity (/16, /48 below) is the
-    // real guarantee. Defeating a Sybil operator who runs relays across several
-    // subnets requires *operator attestation* (labels bound by the authority
-    // set), which is future work — see docs/gotham/README.md.
-    if let (Some(op_a), Some(op_b)) = (eff_operator(a, by_id), eff_operator(b, by_id)) {
-        if op_a == op_b {
-            return false;
-        }
+    // This used to be enforced only when BOTH relays carried a label, which
+    // made it inert exactly where it mattered: an attacker enrolling two relays
+    // simply omits the operator field and the rule never fires. Only the /16
+    // check remained, and two VPS at two providers satisfy it — which is the
+    // whole cost of putting one adversary at both ends of a path. The product
+    // states plainly that entry and exit are never the same operator, so an
+    // UNPROVEN operator must not count as a different one.
+    //
+    // A label is trustworthy because the authority binds it into the signed
+    // attestation (see crypto-gotham-directory::attestation) and the roster
+    // projects it onto the descriptor. No label means no proof, so two
+    // unlabelled relays may not share a path.
+    match (eff_operator(a, by_id), eff_operator(b, by_id)) {
+        (Some(op_a), Some(op_b)) if op_a == op_b => return false,
+        (Some(_), Some(_)) => {}
+        // At least one side is unattested: we cannot show they differ.
+        _ => return false,
     }
     let (ea, eb) = (eff_diversity_ip(a, by_id), eff_diversity_ip(b, by_id));
     // Fail CLOSED: a rendezvous-hosted relay whose R is absent has no resolvable
@@ -963,6 +970,53 @@ mod tests {
             rendezvous: None,
             rendezvous_capable: false,
         }
+    }
+
+    /// Two relays with no attested operator may not share a path.
+    ///
+    /// The rule used to fire only when BOTH carried a label, so an attacker
+    /// enrolling two relays just omitted the operator field and the check never
+    /// ran — leaving only the /16 rule, which two VPS at two providers satisfy.
+    /// That is the entire cost of sitting at both ends of a path, and it is
+    /// what makes header correlation (see crypto-gotham::header) worth
+    /// attempting. Every relay in the live fleet carried `operator: None` while
+    /// the site stated entry and exit are never the same operator.
+    ///
+    /// Every test relay in this module is labelled, which is precisely why the
+    /// hole survived: nothing exercised the unlabelled case.
+    #[test]
+    fn an_unattested_operator_never_counts_as_a_different_one() {
+        let unlabelled = |name: &str, ip: [u8; 4]| {
+            let mut r = fake_relay(name, RelayTier::Mix, ip, "ignored");
+            r.operator = None;
+            r
+        };
+        let by_id: IdIndex = std::collections::HashMap::new();
+
+        // Different /16s, so the network rule is satisfied and only the
+        // operator rule can reject them.
+        let a = unlabelled("a", [203, 0, 113, 1]);
+        let b = unlabelled("b", [198, 51, 100, 1]);
+        assert!(
+            !pair_diverse(&a, &b, &by_id),
+            "two unlabelled relays must NOT be treated as different operators"
+        );
+
+        // One side labelled is still no proof they differ.
+        let mut c = unlabelled("c", [192, 0, 2, 1]);
+        c.operator = Some("acme".into());
+        assert!(
+            !pair_diverse(&a, &c, &by_id),
+            "an unlabelled relay paired with a labelled one is still unproven"
+        );
+
+        // Two distinct attested operators on distinct networks: allowed.
+        let d = fake_relay("d", RelayTier::Mix, [203, 0, 113, 2], "acme");
+        let e = fake_relay("e", RelayTier::Mix, [198, 51, 100, 2], "globex");
+        assert!(
+            pair_diverse(&d, &e, &by_id),
+            "two attested, distinct operators on distinct networks must be allowed"
+        );
     }
 
     #[test]

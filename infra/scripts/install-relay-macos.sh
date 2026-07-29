@@ -38,7 +38,18 @@ case "$TIER" in entry|mix|exit) ;; *) echo "[!] GOTHAM_TIER must be entry|mix|ex
 
 case "$(uname -m)" in
   arm64)  ASSET=gotham-relay-macos-aarch64 ;;
-  x86_64) ASSET=gotham-relay-macos-x86_64 ;;
+  x86_64)
+    # No Intel build is published (the release job only targets
+    # aarch64-apple-darwin), and an Apple Silicon binary cannot run on Intel —
+    # Rosetta translates the other way. Asking for it produced a bare 404 from
+    # curl with no explanation.
+    echo "[!] No Intel (x86_64) macOS build is published for the Gotham relay."
+    echo "    Apple Silicon binaries do not run on Intel Macs."
+    echo "    Options:"
+    echo "      - run the relay on a Linux host instead (install-relay.sh), or"
+    echo "      - build from source:  cargo build --release -p crypto-gotham-relay"
+    exit 1
+    ;;
   *) echo "[!] unsupported CPU arch: $(uname -m)"; exit 1 ;;
 esac
 

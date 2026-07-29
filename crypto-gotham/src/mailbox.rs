@@ -200,12 +200,28 @@ impl Default for MailboxPolicy {
     fn default() -> Self {
         Self {
             max_mailboxes: 100_000,
-            max_msgs_per_mailbox: 256,
+            // A week of TTL at 256 messages is not much for an active
+            // conversation, and a full mailbox does not degrade — it REJECTS,
+            // so the sender's messages stop arriving entirely. 1000 gives real
+            // usage room without costing memory, because of the byte cap below.
+            max_msgs_per_mailbox: 1000,
             max_total_msgs: 1_000_000,
-            max_msg_bytes: 256 * 1024, // 256 KiB sealed envelope
-            // 512 MiB of live sealed bytes. A Gotham message is ~2 KiB, so this
-            // still holds ~250k real messages, while capping what an
-            // unauthenticated flooder can make a volunteer relay allocate.
+            // 16 KiB. The old 256 KiB was 150x larger than anything the
+            // protocol can produce: a deposit is a sealed Gotham payload, so it
+            // is bounded by MAX_PAYLOAD_SIZE (1664) plus ~60 bytes of seal
+            // overhead — under 1.8 KiB. That gap was pure attacker headroom,
+            // since a depositor is unauthenticated by design (a sender cannot
+            // hold the recipient's secret). 16 KiB keeps ~10x margin for
+            // protocol changes and nothing more.
+            max_msg_bytes: 16 * 1024,
+            // 512 MiB of live sealed bytes, unchanged — this is the guard that
+            // actually bounds a volunteer relay's RAM.
+            //
+            // Worst case for ONE mailbox moves from 256 x 256 KiB = 64 MiB to
+            // 1000 x 16 KiB = 16 MiB. So a single flooded mailbox now costs a
+            // QUARTER of what it used to while holding four times as many real
+            // messages, and it takes 32 saturated mailboxes to exhaust the
+            // global budget instead of 8.
             max_total_bytes: 512 * 1024 * 1024,
             default_ttl_secs: 7 * 24 * 3600, // 7 days
             max_ttl_secs: 30 * 24 * 3600,    // 30 days
@@ -686,6 +702,38 @@ mod tests {
         assert_eq!(mb.total(), 1);
         assert_eq!(mb.mailbox_count(), 1); // box 1 emptied and dropped
         assert_eq!(mb.pending(&id(2), 2 * HOUR), 1);
+    }
+
+    /// The default caps have to stay consistent with each other and with what
+    /// the transport can actually carry. They drifted apart once already: the
+    /// per-message cap sat 150x above the largest deposit the protocol can
+    /// produce, which is headroom for a flooder and for nobody else.
+    #[test]
+    fn default_caps_stay_proportionate_to_the_protocol() {
+        let p = MailboxPolicy::default();
+        // A deposit is a sealed Gotham payload: MAX_PAYLOAD_SIZE plus seal
+        // overhead. Anything an honest client sends fits well inside this.
+        const LARGEST_REAL_DEPOSIT: usize = 1664 + 60;
+        assert!(
+            p.max_msg_bytes >= LARGEST_REAL_DEPOSIT * 4,
+            "the per-message cap must leave room for protocol growth"
+        );
+        assert!(
+            p.max_msg_bytes <= LARGEST_REAL_DEPOSIT * 16,
+            "a cap far above the largest real deposit only buys an attacker room"
+        );
+        // One saturated mailbox must not be able to swallow the whole store —
+        // otherwise a single flooded recipient locks every other one out.
+        let worst_one_mailbox = p.max_msgs_per_mailbox * p.max_msg_bytes;
+        assert!(
+            worst_one_mailbox * 16 <= p.max_total_bytes,
+            "one full mailbox is {worst_one_mailbox} bytes of a {} byte budget — \
+             too few mailboxes would exhaust the relay",
+            p.max_total_bytes
+        );
+        // And it has to hold enough for real use: a week of TTL at a few
+        // hundred messages is not a lot for an active conversation.
+        assert!(p.max_msgs_per_mailbox >= 1000);
     }
 
     #[test]

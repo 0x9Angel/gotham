@@ -132,6 +132,90 @@ impl HybridCiphertext {
     }
 }
 
+// ─── Wire encoding ──────────────────────────────────────────────────────────
+//
+// The hybrid handshake is used by the application-layer session (X3DH), which
+// has to put these values in a prekey bundle and an init header and read them
+// back on another machine. Without an encoding the module was unreachable from
+// outside this crate — which is how it ended up advertised on the website and
+// called from nowhere.
+
+impl HybridPublicKey {
+    /// `x25519 || mlkem_ek` — 1216 bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(X25519_PUBKEY_LEN + MLKEM_EK_LEN);
+        v.extend_from_slice(&self.x25519);
+        v.extend_from_slice(self.mlkem.as_slice());
+        v
+    }
+
+    /// Parse `x25519 || mlkem_ek`. Rejects any other length.
+    /// Parse `alpha || mlkem_ct`. Rejects any other length.
+    pub fn from_bytes(b: &[u8]) -> Result<Self> {
+        if b.len() != X25519_PUBKEY_LEN + MLKEM_EK_LEN {
+            return Err(Error::Crypto("hybrid public key wrong length"));
+        }
+        let mut x25519 = [0u8; X25519_PUBKEY_LEN];
+        x25519.copy_from_slice(&b[..X25519_PUBKEY_LEN]);
+        let mut mlkem = Box::new([0u8; MLKEM_EK_LEN]);
+        mlkem.copy_from_slice(&b[X25519_PUBKEY_LEN..]);
+        Ok(Self { x25519, mlkem })
+    }
+}
+
+impl HybridSecretKey {
+    /// `x25519 || mlkem_dk` — 2432 bytes. SECRET: only ever written inside the
+    /// SQLCipher store, never to a plain file.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(X25519_PUBKEY_LEN + MLKEM_DK_LEN);
+        v.extend_from_slice(&self.x25519);
+        v.extend_from_slice(self.mlkem.as_slice());
+        v
+    }
+
+    /// Parse `x25519 || mlkem_dk`. Rejects any other length.
+    pub fn from_bytes(b: &[u8]) -> Result<Self> {
+        if b.len() != X25519_PUBKEY_LEN + MLKEM_DK_LEN {
+            return Err(Error::Crypto("hybrid secret key wrong length"));
+        }
+        let mut x25519 = [0u8; X25519_PUBKEY_LEN];
+        x25519.copy_from_slice(&b[..X25519_PUBKEY_LEN]);
+        let mut mlkem = Box::new([0u8; MLKEM_DK_LEN]);
+        mlkem.copy_from_slice(&b[X25519_PUBKEY_LEN..]);
+        Ok(Self { x25519, mlkem })
+    }
+}
+
+impl HybridCiphertext {
+    /// `alpha || mlkem_ct` — 1120 bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(X25519_PUBKEY_LEN + MLKEM_CT_LEN);
+        v.extend_from_slice(&self.alpha);
+        v.extend_from_slice(self.alpha_prime.as_slice());
+        v
+    }
+
+    /// Parse `alpha || mlkem_ct`. Rejects any other length.
+    pub fn from_bytes(b: &[u8]) -> Result<Self> {
+        if b.len() != X25519_PUBKEY_LEN + MLKEM_CT_LEN {
+            return Err(Error::Crypto("hybrid ciphertext wrong length"));
+        }
+        let mut alpha = [0u8; X25519_PUBKEY_LEN];
+        alpha.copy_from_slice(&b[..X25519_PUBKEY_LEN]);
+        let mut alpha_prime = Box::new([0u8; MLKEM_CT_LEN]);
+        alpha_prime.copy_from_slice(&b[X25519_PUBKEY_LEN..]);
+        Ok(Self { alpha, alpha_prime })
+    }
+}
+
+impl HybridShared {
+    /// The 64 raw bytes, for use as additional IKM by a caller that runs its
+    /// own KDF (X3DH mixes them with its Diffie-Hellman outputs).
+    pub fn as_ikm(&self) -> &[u8; HYBRID_SS_LEN] {
+        &self.0
+    }
+}
+
 /// Combined hybrid shared secret = `ss_x || ss_pq` (64 bytes).
 ///
 /// Zeroized on drop. Used as IKM for HKDF-SHA256 to derive per-hop
