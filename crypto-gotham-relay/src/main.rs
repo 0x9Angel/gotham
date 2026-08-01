@@ -85,6 +85,28 @@ enum Cmd {
         #[arg(long)]
         key_file: PathBuf,
     },
+    /// Say whether this relay is actually carrying traffic, in plain language.
+    ///
+    /// A volunteer who runs the installer gets a binary that starts, a service
+    /// that reports "active", and no way whatsoever to tell that the network is
+    /// ignoring them. Enrolling with one authority is not enough (clients need
+    /// a quorum), an unlabelled relay is never selected, and a relay whose UDP
+    /// port is filtered by the provider looks healthy from the inside. All of
+    /// those produce a relay that runs and carries nothing.
+    Doctor {
+        /// Path to the X25519 identity secret key.
+        #[arg(long)]
+        key_file: PathBuf,
+
+        /// Directory authorities to ask. Repeat the flag; defaults to the
+        /// three that ship with the app.
+        #[arg(long)]
+        authority_url: Vec<String>,
+
+        /// How many authorities must list us for clients to accept the relay.
+        #[arg(long, default_value_t = 2)]
+        quorum: usize,
+    },
     /// Run the relay daemon.
     Run {
         /// Path to the X25519 identity secret key.
@@ -511,6 +533,263 @@ fn build_gossip(
     Ok(Some(service))
 }
 
+/// Keep checking that we are still in the signed directory, and say so loudly
+/// when we are not.
+///
+/// Enrolling once is not a guarantee of anything: a provider firewall change, a
+/// router reboot, an expired lease or an authority that stops attesting all
+/// leave a relay running, reporting itself healthy, and carrying nothing. That
+/// is the "phantom relay" the operator only discovers by asking someone else.
+/// The relay is the one process in a position to notice, so it does.
+///
+/// Deliberately quiet on the happy path: one line when the state CHANGES, never
+/// a periodic heartbeat in the log. An operator who reads a warning here should
+/// be able to trust that it means something.
+async fn watch_own_listing(pk_hex: String, authority_urls: Vec<String>) {
+    // Long enough that a restart or a slow re-enrolment does not trip it.
+    const PERIOD: Duration = Duration::from_secs(300);
+    // Clients need a quorum; being in one directory is not enough to be usable.
+    const QUORUM: usize = 2;
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "self-check disabled: could not build an HTTP client");
+            return;
+        }
+    };
+
+    let mut was_listed: Option<bool> = None;
+    loop {
+        tokio::time::sleep(PERIOD).await;
+
+        let mut seen = 0usize;
+        let mut asked = 0usize;
+        for url in &authority_urls {
+            let Ok(resp) = client.get(format!("{url}/directory")).send().await else {
+                continue;
+            };
+            asked += 1;
+            let Ok(body) = resp.text().await else {
+                continue;
+            };
+            if body.contains(&pk_hex) {
+                seen += 1;
+            }
+        }
+
+        // Every authority unreachable says nothing about us — do not cry wolf.
+        if asked == 0 {
+            continue;
+        }
+
+        let listed = seen >= QUORUM;
+        if was_listed == Some(listed) {
+            continue;
+        }
+        was_listed = Some(listed);
+
+        if listed {
+            info!(
+                authorities = seen,
+                "self-check: this relay is listed and can carry traffic"
+            );
+        } else {
+            warn!(
+                listed_by = seen,
+                quorum = QUORUM,
+                "SELF-CHECK FAILED: clients are NOT using this relay. It is running, \
+                 but fewer than the required number of authorities list it, so no \
+                 message will be routed through it. Run `gotham-relay doctor \
+                 --key-file <your key>` for the likely cause."
+            );
+        }
+    }
+}
+
+/// The authorities that ship with the application. A volunteer who runs
+/// `doctor` with no arguments must be asking the same set the clients ask,
+/// otherwise the answer means nothing.
+const DEFAULT_AUTHORITIES: [&str; 3] = [
+    "http://144.24.205.188:8443",
+    "http://84.235.232.196:8443",
+    "http://84.235.228.107:8443",
+];
+
+/// What one authority says about us.
+struct AuthorityView {
+    url: String,
+    reachable: bool,
+    listed: bool,
+    tier: Option<String>,
+    operator: Option<String>,
+    addr: Option<String>,
+    rendezvous_capable: bool,
+}
+
+async fn ask_authority(url: &str, pk_hex: &str) -> AuthorityView {
+    let mut view = AuthorityView {
+        url: url.to_string(),
+        reachable: false,
+        listed: false,
+        tier: None,
+        operator: None,
+        addr: None,
+        rendezvous_capable: false,
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return view,
+    };
+    let body = match client.get(format!("{url}/directory")).send().await {
+        Ok(r) => match r.text().await {
+            Ok(t) => t,
+            Err(_) => return view,
+        },
+        Err(_) => return view,
+    };
+    view.reachable = true;
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return view;
+    };
+    let relays = doc
+        .get("doc")
+        .and_then(|d| d.get("relays"))
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for r in relays {
+        if r.get("id_pubkey_hex").and_then(|v| v.as_str()) == Some(pk_hex) {
+            view.listed = true;
+            view.tier = r.get("tier").and_then(|v| v.as_str()).map(String::from);
+            view.operator = r.get("operator").and_then(|v| v.as_str()).map(String::from);
+            view.addr = r.get("addr").and_then(|v| v.as_str()).map(String::from);
+            view.rendezvous_capable = r
+                .get("rendezvous_capable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            break;
+        }
+    }
+    view
+}
+
+/// Print a verdict a non-specialist can act on. Returns the process exit code:
+/// 0 when the relay is genuinely usable, 1 otherwise — so it can be dropped
+/// into a cron job or a health check without parsing the text.
+async fn run_doctor(pk_hex: &str, authorities: &[String], quorum: usize) -> i32 {
+    println!("Relais {pk_hex}");
+    println!();
+
+    let mut views = Vec::new();
+    for url in authorities {
+        views.push(ask_authority(url, pk_hex).await);
+    }
+
+    let unreachable: Vec<&AuthorityView> = views.iter().filter(|v| !v.reachable).collect();
+    let listed: Vec<&AuthorityView> = views.iter().filter(|v| v.listed).collect();
+
+    println!("Autorites interrogees :");
+    for v in &views {
+        let state = if !v.reachable {
+            "INJOIGNABLE".to_string()
+        } else if v.listed {
+            "vous connait".to_string()
+        } else {
+            "ne vous connait PAS".to_string()
+        };
+        println!("  {:<32} {}", v.url, state);
+    }
+    println!();
+
+    if !unreachable.is_empty() {
+        println!(
+            "  {} autorite(s) injoignable(s) : le diagnostic est partiel.",
+            unreachable.len()
+        );
+        println!("  Verifiez votre connexion sortante avant de conclure.");
+        println!();
+    }
+
+    // The one number that decides whether clients will use this relay.
+    let n = listed.len();
+    if n < quorum {
+        println!("VERDICT : ce relais N'EST PAS UTILISE.");
+        println!();
+        println!("  {n} autorite(s) vous listent, il en faut {quorum}. Les applications",);
+        println!("  n'acceptent un relais que lorsqu'un quorum d'autorites l'a atteste,");
+        println!("  donc en l'etat aucun message ne passera par vous.");
+        println!();
+        if n == 0 {
+            println!("  Aucune autorite ne vous connait. Les causes, par frequence :");
+            println!("    1. Votre port UDP n'est pas joignable depuis l'exterieur.");
+            println!("       Sur un VPS, pensez au pare-feu du FOURNISSEUR (groupe de");
+            println!("       securite / security list), pas seulement a celui de la machine.");
+            println!("       Derriere une box : relancez l'installeur avec GOTHAM_RENDEZVOUS=on,");
+            println!("       aucune redirection de port n'est alors necessaire.");
+            println!("    2. Le service ne tourne pas : systemctl status 'gotham-relay-*'");
+            println!("    3. Enrolement refuse : journalctl -u 'gotham-relay-*' | grep -i reject");
+        } else {
+            println!("  Certaines autorites vous voient et d'autres non : l'enrolement");
+            println!("  n'a ete fait qu'aupres d'une partie d'entre elles. Relancez");
+            println!("  l'installeur, il les contacte toutes.");
+        }
+        return 1;
+    }
+
+    // Listed by a quorum — but that is not sufficient on its own.
+    let sample = listed[0];
+    println!(
+        "Vu par {n} autorite(s) sur {} (quorum {quorum}) :",
+        views.len()
+    );
+    println!(
+        "  adresse            : {}",
+        sample.addr.as_deref().unwrap_or("?")
+    );
+    println!(
+        "  role               : {}",
+        sample.tier.as_deref().unwrap_or("?")
+    );
+    println!(
+        "  point de rendez-vous : {}",
+        if sample.rendezvous_capable {
+            "oui"
+        } else {
+            "non"
+        }
+    );
+    println!(
+        "  operateur          : {}",
+        sample.operator.as_deref().unwrap_or("AUCUN")
+    );
+    println!();
+
+    if sample.operator.is_none() {
+        println!("VERDICT : ce relais NE SERA JAMAIS CHOISI.");
+        println!();
+        println!("  Il est bien enrole, mais sans etiquette d'operateur. La selection");
+        println!("  de chemin refuse deux sauts dont elle ne peut pas PROUVER qu'ils");
+        println!("  appartiennent a des operateurs differents, donc un relais sans");
+        println!("  etiquette n'entre dans aucun chemin.");
+        println!();
+        println!("  Relancez l'installeur, ou ajoutez --operator <votre-nom> au service.");
+        return 1;
+    }
+
+    println!("VERDICT : ce relais fonctionne et peut acheminer du trafic.");
+    println!();
+    println!("  Merci : chaque relais independant agrandit la foule dans laquelle");
+    println!("  chaque message se fond.");
+    0
+}
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
@@ -541,6 +820,22 @@ async fn main() -> std::io::Result<()> {
             Ok(())
         }
 
+        Cmd::Doctor {
+            key_file,
+            authority_url,
+            quorum,
+        } => {
+            let sk = read_key_file(&key_file)?;
+            let pk = PublicKey::from(&StaticSecret::from(sk)).to_bytes();
+            let pk_hex = hex::encode(pk);
+            let authorities = if authority_url.is_empty() {
+                DEFAULT_AUTHORITIES.iter().map(|s| s.to_string()).collect()
+            } else {
+                authority_url
+            };
+            let code = run_doctor(&pk_hex, &authorities, quorum).await;
+            std::process::exit(code);
+        }
         Cmd::Run {
             key_file,
             listen_port,
@@ -664,7 +959,12 @@ async fn main() -> std::io::Result<()> {
                     authority_pop_pk,
                 };
                 info!("auto-enrollment enabled — announcing to directory authority");
+                let watch_urls: Vec<String> = std::iter::once(cfg.authority_url.clone())
+                    .chain(cfg.extra_authority_urls.iter().cloned())
+                    .collect();
+                let watch_pk = pk_hex.clone();
                 tokio::spawn(crypto_gotham_relay::enroll_client::run_enrollment_loop(cfg));
+                tokio::spawn(watch_own_listing(watch_pk, watch_urls));
             } else {
                 warn!(
                     "no --authority-url set: this relay will forward packets but will \

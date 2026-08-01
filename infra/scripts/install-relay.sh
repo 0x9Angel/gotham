@@ -145,16 +145,25 @@ case "${GOTHAM_RENDEZVOUS:-auto}" in
     fi ;;
 esac
 
-if [[ "$MODE" == "rendezvous" ]]; then
-    echo "    No reachable public address — enrolling via a RENDEZVOUS point"
-    echo "    (RFC B3: works behind CGNAT / mobile 4G-5G / broken UPnP, no port-forward)."
+# Look up a rendezvous point and append the flags that use it. Factored out
+# because it is needed twice: once when we already know we are behind a NAT, and
+# once as the AUTOMATIC FALLBACK when a "directly reachable" relay turns out not
+# to be — which is the common case, and the one that used to require the project
+# owner to open a port on the volunteer's router by hand.
+pick_rendezvous() {
     DIR_JSON="$(curl -fsSL --max-time 10 "$AUTHORITY_URL/directory" || true)"
-    # Pick a relay advertising rendezvous_capable. The directory is compact JSON;
-    # split per-relay on '{' and match the flag, then pull its kem + addr.
+    # The directory is compact JSON; split per-relay on '{' and match the flag,
+    # then pull its kem + addr.
     R_LINE="$(printf '%s' "$DIR_JSON" | tr '{' '\n' | grep '"rendezvous_capable":true' | head -1)"
     R_KEM="$(printf '%s'  "$R_LINE" | sed -n 's/.*"kem_pubkey_hex":"\([0-9a-fA-F]\{64\}\)".*/\1/p')"
     R_ADDR="$(printf '%s' "$R_LINE" | sed -n 's/.*"addr":"\([0-9.:]\{7,\}\)".*/\1/p')"
-    if [[ -z "$R_KEM" || -z "$R_ADDR" ]]; then
+    [[ -n "$R_KEM" && -n "$R_ADDR" ]]
+}
+
+if [[ "$MODE" == "rendezvous" ]]; then
+    echo "    No reachable public address — enrolling via a RENDEZVOUS point"
+    echo "    (RFC B3: works behind CGNAT / mobile 4G-5G / broken UPnP, no port-forward)."
+    if ! pick_rendezvous; then
         echo "[!] No rendezvous point is currently available from $AUTHORITY_URL."
         echo "    An operator must run a public relay with --rendezvous-capable, OR"
         echo "    set GOTHAM_ADVERTISE_IP=<reachable.ip> if you CAN port-forward UDP $PORT."
@@ -266,6 +275,37 @@ for _ in $(seq 1 20); do
     fi
 done
 
+# AUTOMATIC FALLBACK. A relay that believed it was directly reachable and was
+# not is the single most common failure, and the one that produced "phantom"
+# relays: the service runs, the volunteer sees no error, and the network ignores
+# them. The heuristic above cannot detect a provider-side firewall or a router
+# that silently drops inbound UDP — only the authority's dial-back can, and it
+# has just told us by NOT listing us.
+#
+# Rather than leave the volunteer to diagnose that, switch to the rendezvous
+# transport, which needs no inbound reachability at all, and try again.
+if [[ "$ENROLLED" -eq 0 && "$MODE" == "direct" && "${GOTHAM_RENDEZVOUS:-auto}" != "off" ]]; then
+    echo
+    echo "[!] No authority could reach UDP $PORT on $ADVERTISE_IP."
+    echo "    Switching to the rendezvous transport — no port-forward needed."
+    if pick_rendezvous; then
+        echo "    Rendezvous relay: $R_ADDR"
+        MODE="rendezvous"
+        EXTRA+=" --rendezvous-key $R_KEM --rendezvous-addr $R_ADDR"
+        sed -i "s|^GOTHAM_EXTRA_ARGS=.*|GOTHAM_EXTRA_ARGS=$EXTRA|" "$ENVFILE"
+        systemctl restart crypto-gotham-relay.service
+        echo "    Re-enrolling…"
+        for _ in $(seq 1 20); do
+            sleep 5
+            SEEN_BY="$(count_attestations)"
+            if [[ "$SEEN_BY" -ge "$QUORUM_NEEDED" ]]; then ENROLLED=1; break; fi
+        done
+    else
+        echo "    …but no rendezvous point is available right now, so this relay"
+        echo "    cannot join until one comes back. Nothing else to do on your side."
+    fi
+fi
+
 echo
 echo "============================================================"
 if [[ "$ENROLLED" -eq 1 ]]; then
@@ -296,6 +336,13 @@ else
 fi
 echo " Authority  : $AUTHORITY_URL"
 echo " Operator   : $OPERATOR   (a relay without a label is never routed)"
+echo "------------------------------------------------------------"
+echo " Check this relay at any time — it answers in plain language:"
+echo "   sudo $BIN doctor --key-file $KEYFILE"
+echo
+echo " The relay also checks itself every 5 minutes and logs a warning if the"
+echo " network stops using it, so a relay that breaks later does not go unnoticed:"
+echo "   journalctl -u crypto-gotham-relay -f | grep SELF-CHECK"
 echo
 echo " Live logs  : tail -F $LOG_DIR/relay.log"
 echo " Status     : systemctl status crypto-gotham-relay.service"
