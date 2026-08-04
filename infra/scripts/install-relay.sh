@@ -29,7 +29,10 @@
 #                         (RFC B3) when no reachable public address is found —
 #                         this is what lets a 4G/5G / CGNAT box be a relay.
 #   GOTHAM_COUNTRY        ISO 3166-1 code to publish (e.g. FR). Optional.
-#   GOTHAM_OPERATOR       Public nickname (transparency only). Optional.
+#   GOTHAM_OPERATOR       REQUIRED. Public nickname identifying who runs this
+#                         relay. Path selection refuses two hops it cannot prove
+#                         belong to different operators, so an unlabelled relay
+#                         is never selected. Use the SAME value on all yours.
 #
 # What it does:
 #   1. Installs minimal deps (curl, ufw, ca-certificates)
@@ -57,7 +60,23 @@ COUNTRY="${GOTHAM_COUNTRY:-}"
 # the hostname, which is at least stable and distinct per machine; operators
 # running several relays should set GOTHAM_OPERATOR to the same value on all of
 # them so diversity actually reflects who runs what.
-OPERATOR="${GOTHAM_OPERATOR:-$(hostname -s 2>/dev/null || hostname)}"
+OPERATOR="${GOTHAM_OPERATOR:-}"
+if [[ -z "$OPERATOR" ]]; then
+    echo "[!] GOTHAM_OPERATOR is required and was not set."
+    echo
+    echo "    It is a public nickname saying who runs this relay. Path selection"
+    echo "    fails closed on operator diversity: two relays that cannot be PROVEN"
+    echo "    to belong to different operators never share a path."
+    echo
+    echo "    This used to default to the hostname, which was worse than useless:"
+    echo "    two machines run by the same person got two different labels and"
+    echo "    counted as two independent operators, which is precisely the"
+    echo "    property the rule exists to enforce. Use the SAME value on every"
+    echo "    relay you run, and one nobody else is using."
+    echo
+    echo "    Example:  GOTHAM_OPERATOR=alice GOTHAM_TIER=exit sudo -E $0"
+    exit 1
+fi
 ENROLL_TOKEN="${GOTHAM_ENROLL_TOKEN:-}"
 
 REPO="0x9Angel/gotham-relay"

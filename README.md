@@ -74,10 +74,24 @@ Rust stable. No C toolchain beyond what `ring` needs.
 
 ## Running a relay
 
-Volunteer relays are what make the network worth anything. If you have a machine
-that stays on — a VPS, a home server, a Raspberry Pi — see
-[`docs/running-a-cgnat-relay.md`](docs/running-a-cgnat-relay.md) and the
+Volunteer relays are what make the network worth anything. **Read these three
+before you install anything** — they say what you are agreeing to operate, what
+your machine will hold, and what to do if someone comes asking:
+
+- [`OPERATOR-GUIDE.md`](OPERATOR-GUIDE.md) — what a relay does, what each tier
+  sees, what we ask of you, and what you are trusting us with today
+- [`LOGGING-POLICY.md`](LOGGING-POLICY.md) — an inventory, checked against the
+  source, of everything a relay records and keeps
+- [`ABUSE-FAQ.md`](ABUSE-FAQ.md) — complaints, legal requests, and a reply
+  template for your hosting provider
+
+If you have a machine that stays on — a VPS, a home server, a Raspberry Pi — see
+also [`docs/running-a-cgnat-relay.md`](docs/running-a-cgnat-relay.md) and the
 installers in [`infra/scripts/`](infra/scripts/).
+
+`GOTHAM_OPERATOR` is required and the installer refuses without it: an
+unlabelled relay is never selected by path selection, so it would burn your
+bandwidth while looking perfectly healthy.
 
 A relay behind CGNAT needs **no port forwarding**: it keeps an outbound tunnel to
 a public rendezvous relay and is reachable through it.

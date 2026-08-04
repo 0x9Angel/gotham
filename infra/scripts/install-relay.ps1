@@ -8,13 +8,24 @@
   after the PC is shut down and turned back on, the relay comes back on its own.
   Opens the Windows Firewall for the UDP port.
 
-  Run in an ELEVATED PowerShell (no token needed, enrollment is open):
+  Run in an ELEVATED PowerShell (no token needed, enrollment is open, but you
+  MUST name yourself so the network is allowed to route through you):
+    $env:GOTHAM_OPERATOR='your-name'
     irm https://raw.githubusercontent.com/0x9Angel/gotham-relay/main/infra/scripts/install-relay.ps1 | iex
 
-  Env vars (all optional; same as the Linux/macOS installers):
+  Env vars (same as the Linux/macOS installers):
+    GOTHAM_OPERATOR      REQUIRED. Public nickname identifying who runs this
+                         relay. Path selection refuses two hops it cannot PROVE
+                         belong to different operators, so an unlabelled relay
+                         is never routed. Use the SAME value on every relay you
+                         run, so diversity reflects who actually runs what.
     GOTHAM_ENROLL_TOKEN  Only if the authority runs in closed/token mode.
                          Enrollment is OPEN by default - you do NOT need one.
     GOTHAM_AUTHORITY_URL default http://144.24.205.188:8443
+    GOTHAM_EXTRA_AUTHORITY_URLS
+                         Space-separated ADDITIONAL authorities to enroll with.
+                         Clients need a quorum of attestations, so the default is
+                         the other two authorities of the shipped set.
     GOTHAM_TIER          entry|mix|exit (default mix)
     GOTHAM_PORT          default 443
     GOTHAM_ADVERTISE_IP  optional; if unset the relay auto-maps its port and
@@ -30,27 +41,49 @@ $Token   = $env:GOTHAM_ENROLL_TOKEN
 $AuthUrl = if ($env:GOTHAM_AUTHORITY_URL) { $env:GOTHAM_AUTHORITY_URL } else { "http://144.24.205.188:8443" }
 $Tier    = if ($env:GOTHAM_TIER) { $env:GOTHAM_TIER } else { "mix" }
 $Port    = if ($env:GOTHAM_PORT) { $env:GOTHAM_PORT } else { "443" }
+# Clients admit a relay only when k of n authorities have attested it (k=2, n=3
+# in the shipped app). A relay enrolled with the primary alone runs, reports
+# itself healthy, and is dropped in silence by every client. Enrol with all three.
+$ExtraAuthUrls = if ($env:GOTHAM_EXTRA_AUTHORITY_URLS) {
+    $env:GOTHAM_EXTRA_AUTHORITY_URLS -split '\s+' | Where-Object { $_ }
+} else {
+    @("http://84.235.232.196:8443", "http://84.235.228.107:8443")
+}
+$Operator = $env:GOTHAM_OPERATOR
 
 if (@("entry", "mix", "exit") -notcontains $Tier) { throw "GOTHAM_TIER must be entry|mix|exit (got '$Tier')" }
+
+# Checked BEFORE anything is downloaded: a relay that cannot be routed is worse
+# than no relay, because nobody finds out. Better a clean refusal now.
+if (-not $Operator) {
+    throw @"
+GOTHAM_OPERATOR is required and was not set.
+
+Clients refuse to build a path through two relays unless they can prove the
+relays belong to DIFFERENT operators, and a relay with no operator label counts
+as unproven. An unlabelled relay would run, report itself healthy, and never
+carry a single packet.
+
+Re-run with a public nickname, e.g.:
+  `$env:GOTHAM_OPERATOR='your-name'
+  irm https://raw.githubusercontent.com/$Repo/main/infra/scripts/install-relay.ps1 | iex
+
+Use the SAME value on every relay you run, so the network can tell your machines
+apart from everyone else's.
+"@
+}
+# The label is passed through the Scheduled Task's single command-line string,
+# so restrict it to characters that cannot become a separate argument.
+if ($Operator -notmatch '^[A-Za-z0-9._-]{1,32}$') {
+    throw "GOTHAM_OPERATOR must be 1 to 32 characters from A-Z a-z 0-9 . _ - (got '$Operator')"
+}
 
 $Dir = Join-Path $env:ProgramData "Gotham"
 $Bin = Join-Path $Dir "gotham-relay.exe"
 $Key = Join-Path $Dir "relay.key"
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 
-# C:\ProgramData grants Users read by default and children inherit it, so the
-# relay's long-term secret was readable by every account on the machine — and
-# on a shared or multi-user host that is the whole identity of the relay.
-# Replace inheritance with an explicit ACL: SYSTEM and Administrators only.
-$Acl = Get-Acl $Dir
-$Acl.SetAccessRuleProtection($true, $false)   # break inheritance, drop inherited ACEs
-foreach ($who in @("NT AUTHORITY\SYSTEM", "BUILTIN\Administrators")) {
-    $Acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-        $who, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
-}
-Set-Acl -Path $Dir -AclObject $Acl
-
-Write-Host "[1/5] Downloading + verifying binary..."
+Write-Host "[1/6] Downloading + verifying binary..."
 $Asset = "gotham-relay-windows-x86_64.exe"
 $Base  = "https://github.com/$Repo/releases/latest/download"
 Invoke-WebRequest -Uri "$Base/$Asset"        -OutFile $Bin
@@ -59,11 +92,13 @@ $expected = ((Get-Content "$Bin.sha256") -split '\s+')[0].ToLower()
 $actual   = (Get-FileHash $Bin -Algorithm SHA256).Hash.ToLower()
 if ($expected -ne $actual) { Remove-Item $Bin -Force; throw "Checksum verification FAILED - refusing to install." }
 
-Write-Host "[2/5] Generating relay identity (if absent)..."
+Write-Host "[2/6] Generating relay identity (if absent)..."
 if (-not (Test-Path $Key)) { & $Bin keygen --key-file $Key | Out-Null }
-$PubKey = (& $Bin pubkey --key-file $Key)
+# One trimmed line: the enrollment check below matches this against the signed
+# directory, and a stray newline or a second line would break that match.
+$PubKey = (& $Bin pubkey --key-file $Key | Select-Object -First 1).ToString().Trim()
 
-Write-Host "[3/5] Determining reachability (direct vs rendezvous)..."
+Write-Host "[3/6] Determining reachability (direct vs rendezvous)..."
 # Public IP (best-effort). Not fatal: a CGNAT box has no reachable public address
 # and falls back to a rendezvous point (RFC B3) below.
 $AdvIp = $env:GOTHAM_ADVERTISE_IP
@@ -71,6 +106,14 @@ if (-not $AdvIp) {
     try   { $AdvIp = (Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 8).ToString().Trim() }
     catch { $AdvIp = $null }
 }
+
+# Flags every relay carries whatever its transport: one --extra-authority-url per
+# additional authority (each one's PoP key is auto-fetched from its own /pop),
+# plus the operator label without which no path may include this relay.
+# Built with array concatenation so the flags stay separate arguments.
+$CommonArgs = @()
+foreach ($u in $ExtraAuthUrls) { $CommonArgs += @("--extra-authority-url", $u) }
+$CommonArgs += @("--operator", $Operator)
 
 # Decide DIRECT (we have a reachable public address) vs RENDEZVOUS (behind CGNAT
 # / mobile 4G-5G / broken UPnP: keep an OUTBOUND tunnel to a public rendezvous
@@ -103,7 +146,7 @@ if ($Mode -eq "rendezvous") {
         "--listen-host", "0.0.0.0", "--listen-port", $Port,
         "--authority-url", $AuthUrl, "--tier", $Tier, "--heartbeat-secs", "60",
         "--rendezvous-key", $rp.kem_pubkey_hex, "--rendezvous-addr", $rp.addr
-    )
+    ) + $CommonArgs
     $AdvMsg = "via rendezvous $($rp.addr) (CGNAT/B3)"
 } else {
     if (-not $AdvIp) {
@@ -115,7 +158,7 @@ if ($Mode -eq "rendezvous") {
         "--listen-host", "0.0.0.0", "--listen-port", $Port,
         "--authority-url", $AuthUrl, "--tier", $Tier, "--heartbeat-secs", "60",
         "--advertise-addr", "$($AdvIp):$Port"
-    )
+    ) + $CommonArgs
     $AdvMsg = "$($AdvIp):$Port"
 }
 
@@ -123,7 +166,7 @@ if ($Mode -eq "rendezvous") {
 # in the task's command line. Open enrollment needs none.
 if ($Token) { [Environment]::SetEnvironmentVariable("GOTHAM_ENROLL_TOKEN", $Token, "Machine") }
 
-Write-Host "[4/5] Registering boot Scheduled Task (SYSTEM, background, auto-restart)..."
+Write-Host "[4/6] Registering boot Scheduled Task (SYSTEM, background, auto-restart)..."
 $action    = New-ScheduledTaskAction -Execute $Bin -Argument ($binArgs -join " ")
 $trigger   = New-ScheduledTaskTrigger -AtStartup
 $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
@@ -136,7 +179,7 @@ Register-ScheduledTask -TaskName "GothamRelay" -Action $action -Trigger $trigger
     -Principal $principal -Settings $settings `
     -Description "Gotham mixnet relay - auto-starts in the background at boot" | Out-Null
 
-Write-Host "[5/5] Firewall + start now..."
+Write-Host "[5/6] Firewall + start now..."
 # Rendezvous mode is OUTBOUND-only - no inbound port to open. Only open UDP when
 # we advertise a directly-reachable address.
 if ($Mode -eq "direct") {
@@ -145,13 +188,51 @@ if ($Mode -eq "direct") {
 }
 Start-ScheduledTask -TaskName "GothamRelay"
 
+Write-Host "[6/6] Waiting for the authorities to accept enrollment..."
+# Ask the AUTHORITIES, not the task state. A running task proves nothing: the
+# directory is ground truth, and clients admit a relay only once k of n
+# authorities have attested it (k=2 today). Being listed by the primary alone
+# means the relay runs, looks healthy, and is dropped by every client.
+$QuorumNeeded = if ($env:GOTHAM_QUORUM_NEEDED) { [int]$env:GOTHAM_QUORUM_NEEDED } else { 2 }
+$AllAuthorities = @($AuthUrl) + $ExtraAuthUrls
+
+function Get-AttestationCount {
+    $n = 0
+    foreach ($a in $AllAuthorities) {
+        try {
+            $body = (Invoke-WebRequest -Uri "$a/directory" -TimeoutSec 8 -UseBasicParsing).Content
+            if ($body -match $PubKey) { $n++ }
+        } catch { }
+    }
+    $n
+}
+
+$SeenBy = 0
+for ($i = 0; $i -lt 20; $i++) {
+    Start-Sleep -Seconds 5
+    $SeenBy = Get-AttestationCount
+    if ($SeenBy -ge $QuorumNeeded) { break }
+}
+
 Write-Host ""
 Write-Host "============================================================"
-Write-Host " Gotham relay installed - starts automatically at every boot,"
-Write-Host " in the background (Scheduled Task: GothamRelay)."
+if ($SeenBy -ge $QuorumNeeded) {
+    Write-Host " Gotham relay is LIVE and ENROLLED ($SeenBy authorities attest it)"
+} else {
+    Write-Host " Gotham relay installed - NOT usable by clients yet" -ForegroundColor Yellow
+    Write-Host " Attested by $SeenBy of the $QuorumNeeded authorities required."
+    if ($SeenBy -gt 0) {
+        Write-Host " It IS running and one authority sees it, but clients need a quorum,"
+        Write-Host " so no traffic is routed through it until the others accept it."
+    }
+}
+Write-Host " It starts automatically at every boot, in the background"
+Write-Host " (Scheduled Task: GothamRelay)."
 Write-Host " Public key : $PubKey"
 Write-Host " Reachable  : $AdvMsg   (tier: $Tier, port $Port/udp)"
 Write-Host " Authority  : $AuthUrl"
+Write-Host " Also enrolled with: $($ExtraAuthUrls -join ' ')"
+Write-Host " Operator   : $Operator   (a relay without a label is never routed)"
 Write-Host " Status     : Get-ScheduledTask GothamRelay | Get-ScheduledTaskInfo"
 Write-Host " Stop/Start : Stop-ScheduledTask GothamRelay  /  Start-ScheduledTask GothamRelay"
 Write-Host " Uninstall  : irm https://raw.githubusercontent.com/$Repo/main/infra/scripts/uninstall-relay.ps1 | iex"
@@ -168,6 +249,6 @@ if ($Mode -eq "rendezvous") {
     Write-Host "                   `$env:GOTHAM_RENDEZVOUS='on' to enrol via a rendezvous point."
 }
 Write-Host ""
-Write-Host " Confirm you actually ENROLLED (run this now):" -ForegroundColor Cyan
+Write-Host " Re-check enrollment at any time (a relay can drop out later):" -ForegroundColor Cyan
 Write-Host "   irm https://raw.githubusercontent.com/0x9Angel/gotham-relay/main/infra/scripts/diagnose-relay.ps1 | iex"
 Write-Host "============================================================"
