@@ -175,6 +175,81 @@ impl RateLimiter {
     }
 }
 
+/// Per-source token buckets, bounded.
+///
+/// F-55 — the node-global limiter is a single bucket consulted once per
+/// packet, so one flooder's traffic and everyone else's come out of the SAME
+/// budget. That is precisely the lever an n-1 attack needs: fill the bucket
+/// and third-party packets are shed, leaving the attacker's own flow alone in
+/// the mix. Attributing the budget to a source removes it — a flood can then
+/// only shed the flooder.
+///
+/// The map itself is an attack surface, so it is bounded: an adversary with
+/// many addresses would otherwise grow it without limit. When full, the
+/// longest-idle entry is evicted, which is safe because evicting a bucket only
+/// forgives past usage for a source that has been quiet.
+///
+/// This is a SECOND limiter, not a replacement: the node-global one stays as
+/// the outer ceiling on what this relay will carry in total.
+pub struct PerSourceLimiter {
+    buckets: std::collections::HashMap<std::net::IpAddr, (RateLimiter, Instant)>,
+    max_entries: usize,
+    max_pps: f64,
+    max_bytes_per_day: u64,
+}
+
+impl PerSourceLimiter {
+    /// Build a per-source limiter: `max_pps` and `max_bytes_per_day` per
+    /// SOURCE, and at most `max_entries` sources tracked at once.
+    #[must_use]
+    pub fn new(max_pps: f64, max_bytes_per_day: u64, max_entries: usize) -> Self {
+        Self {
+            buckets: std::collections::HashMap::new(),
+            max_entries: max_entries.max(1),
+            max_pps,
+            max_bytes_per_day,
+        }
+    }
+
+    /// Account one packet from `src`. Same semantics as [`RateLimiter::check`].
+    pub fn check(&mut self, src: std::net::IpAddr, packet_len: usize) -> RateDecision {
+        self.check_at(src, packet_len, Instant::now())
+    }
+
+    /// Deterministic, clock-injectable form — the tests drive this one.
+    pub fn check_at(
+        &mut self,
+        src: std::net::IpAddr,
+        packet_len: usize,
+        now: Instant,
+    ) -> RateDecision {
+        if !self.buckets.contains_key(&src) && self.buckets.len() >= self.max_entries {
+            // Evict the longest idle. Doing this BEFORE inserting keeps the
+            // map at its bound even under a churn of one-packet sources.
+            if let Some(victim) = self
+                .buckets
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(ip, _)| *ip)
+            {
+                self.buckets.remove(&victim);
+            }
+        }
+        let entry = self
+            .buckets
+            .entry(src)
+            .or_insert_with(|| (RateLimiter::new(self.max_pps, self.max_bytes_per_day), now));
+        entry.1 = now;
+        entry.0.check_at(packet_len, now)
+    }
+
+    /// How many sources are currently tracked. For tests and metrics.
+    #[must_use]
+    pub fn tracked(&self) -> usize {
+        self.buckets.len()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +372,63 @@ mod tests {
             rl2.check_at(2048, t0),
             RateDecision::Throttled(ThrottleReason::Rate)
         );
+    }
+
+    /// F-55 — one flooder must not spend everyone else's budget.
+    ///
+    /// That shared budget is the n-1 lever: fill the node-global bucket and
+    /// third-party packets are shed, leaving the attacker's own flow alone in
+    /// the mix, which is exactly the condition an n-1 attack needs.
+    #[test]
+    fn a_flood_from_one_source_does_not_shed_another() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut lim = PerSourceLimiter::new(10.0, 0, 64);
+        let t0 = Instant::now();
+        let flooder = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+        let victim = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4));
+
+        // The flooder empties its own bucket (capacity is 2x max_pps).
+        let mut throttled = 0;
+        for _ in 0..200 {
+            if !lim.check_at(flooder, 2048, t0).is_allowed() {
+                throttled += 1;
+            }
+        }
+        assert!(throttled > 0, "the flooder must hit its own limit");
+
+        // …and the victim, at the same instant, is untouched.
+        for _ in 0..10 {
+            assert!(
+                lim.check_at(victim, 2048, t0).is_allowed(),
+                "a second source must not pay for the first one's flood"
+            );
+        }
+    }
+
+    /// The map is itself an attack surface, so it is bounded.
+    #[test]
+    fn the_source_table_is_bounded_and_evicts_the_longest_idle() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut lim = PerSourceLimiter::new(10.0, 0, 4);
+        let t0 = Instant::now();
+
+        // Five distinct sources against a table of four.
+        for i in 0..5u8 {
+            lim.check_at(
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, i)),
+                2048,
+                t0 + Duration::from_millis(u64::from(i)),
+            );
+        }
+        assert_eq!(lim.tracked(), 4, "the table must stay at its bound");
+
+        // The evicted one is the longest idle — the first seen here.
+        let oldest = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 0));
+        assert!(
+            lim.check_at(oldest, 2048, t0 + Duration::from_millis(10))
+                .is_allowed(),
+            "an evicted source starts fresh, which only forgives a quiet one"
+        );
+        assert_eq!(lim.tracked(), 4);
     }
 }

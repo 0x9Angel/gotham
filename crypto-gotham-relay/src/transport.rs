@@ -1221,6 +1221,35 @@ fn negotiated_alpn(conn: &quinn::Connection) -> Option<Vec<u8>> {
 
 // ─── Server: serve one incoming connection ──────────────────────────────────
 
+/// F-55 — per-source token buckets for inbound packets.
+///
+/// Process-wide because it describes this node's inbound, which is a
+/// process-scoped fact; a `OnceLock` rather than a parameter so all three
+/// `serve_connection` callers get it without a signature that one of them
+/// could be updated to skip.
+///
+/// The budget is deliberately generous — this is not a quality-of-service
+/// mechanism, it exists so one flooder cannot spend everyone else's share of
+/// the node-global bucket and leave its own flow alone in the mix.
+static PER_SOURCE_LIMITER: std::sync::OnceLock<Mutex<crate::rate_limit::PerSourceLimiter>> =
+    std::sync::OnceLock::new();
+
+/// Packets per second one source address may sustain.
+const PER_SOURCE_MAX_PPS: f64 = 200.0;
+/// Sources tracked at once; the longest-idle is evicted beyond this.
+const PER_SOURCE_MAX_TRACKED: usize = 4096;
+
+/// The process-wide per-source limiter, created on first use.
+fn per_source_limiter() -> &'static Mutex<crate::rate_limit::PerSourceLimiter> {
+    PER_SOURCE_LIMITER.get_or_init(|| {
+        Mutex::new(crate::rate_limit::PerSourceLimiter::new(
+            PER_SOURCE_MAX_PPS,
+            0, // no daily byte quota per source; the node-global one covers that
+            PER_SOURCE_MAX_TRACKED,
+        ))
+    })
+}
+
 /// Handle one inbound QUIC connection: complete the Noise handshake then
 /// process each frame the client sends, dispatching the resulting
 /// [`ProcessOutcome`] (drop / forward / deliver-local).
@@ -1239,6 +1268,7 @@ pub async fn serve_connection(
     pool: Arc<ConnectionPool>,
     delivery: Option<DeliveryHandler>,
 ) -> Result<(), TransportError> {
+    let src_ip = conn.remote_address().ip();
     let (mut send, mut recv) = conn.accept_bi().await?;
     let mut noise = noise_responder_handshake(&static_sk, &mut send, &mut recv).await?;
     debug!("noise handshake completed for inbound conn");
@@ -1249,6 +1279,19 @@ pub async fn serve_connection(
             Err(TransportError::Read(_)) | Err(TransportError::Io(_)) => break,
             Err(e) => return Err(e),
         };
+
+        // F-55 — shed THIS source before touching the shared budget, so a
+        // flood cannot displace third-party traffic. Cheaper than
+        // `relay.process` too: a token-bucket comparison, no crypto.
+        if !per_source_limiter()
+            .lock()
+            .await
+            .check(src_ip, packet.len())
+            .is_allowed()
+        {
+            debug!(%src_ip, "dropped: per-source rate limited");
+            continue;
+        }
 
         // Process under the lock — held only for the time of one
         // `relay.process()` call (≪ 1 ms typical).

@@ -128,7 +128,14 @@ enum Cmd {
         listen_host: String,
 
         /// Mean Poisson delay in microseconds.
-        #[arg(long, default_value_t = 20_000)]
+        ///
+        /// F-30 — was 20 ms, which sits below the jitter of an ordinary internet
+        /// path: an observer watching a relay's two links could pair packets by
+        /// arrival order with no statistics at all, so the hold cost latency and
+        /// bought no mixing. This is the fallback applied to any packet carrying
+        /// `delay_micros == 0` (cover traffic, older senders), so it has to be a
+        /// value that actually mixes. 500 ms is the Balanced mean.
+        #[arg(long, default_value_t = 500_000)]
         delay_micros: u64,
 
         /// Max entries in the replay cache.

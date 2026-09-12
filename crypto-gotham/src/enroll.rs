@@ -439,6 +439,13 @@ struct RegEntry {
     enrollment: RelayEnrollment,
     /// Unix-seconds of the most recent accepted heartbeat.
     last_seen: u64,
+    /// Unix-seconds of the FIRST enrolment of this key.
+    ///
+    /// F-60 — seniority, and it exists to decide who survives a full diversity
+    /// bucket. Carried forward across heartbeats: rebuilding it on every
+    /// heartbeat would make every relay permanently brand new, which is the
+    /// same as not having it.
+    first_seen: u64,
 }
 
 /// In-memory roster of live relays held by the directory authority.
@@ -473,11 +480,18 @@ impl Registry {
                 return Err(Error::Directory("enrollment seq not increasing (replay)"));
             }
         }
+        // Seniority survives the heartbeat that refreshes the entry.
+        let first_seen = self
+            .entries
+            .get(&e.kem_pubkey_hex)
+            .map(|existing| existing.first_seen)
+            .unwrap_or(now);
         self.entries.insert(
             e.kem_pubkey_hex.clone(),
             RegEntry {
                 enrollment: e,
                 last_seen: now,
+                first_seen,
             },
         );
         Ok(())
@@ -518,6 +532,36 @@ impl Registry {
         Some((addr, pk))
     }
 
+    /// Order relays so the diversity caps keep the ESTABLISHED ones.
+    ///
+    /// F-60 — the input used to be sorted by `id_pubkey_hex`, and
+    /// `apply_diversity_caps` keeps whatever comes first in a full bucket. The
+    /// identity IS the relay's own X25519 key, freely regenerable, so an attacker
+    /// grinds keys with a low hex prefix and their relays win every contested
+    /// bucket — evicting the honest relays in the victim's /24 at a cost of about
+    /// 2^8 tries per nibble pair, with `MAX_RELAYS_PER_24 = 3` meaning three VMs
+    /// in that /24 are enough.
+    ///
+    /// Seniority first, then a HASH of the identity rather than the identity
+    /// itself: grinding a key no longer buys priority, because the tie-break is a
+    /// value the attacker cannot steer toward "low" any more cheaply than toward
+    /// any other target — and seniority cannot be ground at all, only waited for.
+    fn order_for_diversity_caps(
+        entries: &std::collections::HashMap<String, RegEntry>,
+        descriptors: &mut [RelayDescriptor],
+    ) {
+        descriptors.sort_by_cached_key(|d| {
+            let first_seen = entries
+                .get(&d.kem_pubkey_hex)
+                .map(|e| e.first_seen)
+                .unwrap_or(u64::MAX);
+            (
+                first_seen,
+                *blake3::hash(d.id_pubkey_hex.as_bytes()).as_bytes(),
+            )
+        });
+    }
+
     /// k-of-n decentralised admission: the `(identity_hex, epoch, operator)` of
     /// every LIVE relay that proposed an admission epoch AND survives the same
     /// diversity caps as the signed directory. The authority signs each tuple on
@@ -537,7 +581,7 @@ impl Registry {
             .values()
             .map(|v| v.enrollment.to_descriptor())
             .collect();
-        descriptors.sort_by(|a, b| a.id_pubkey_hex.cmp(&b.id_pubkey_hex));
+        Self::order_for_diversity_caps(&self.entries, &mut descriptors);
         apply_diversity_caps(descriptors)
             .into_iter()
             .filter_map(|d| {
@@ -572,7 +616,7 @@ impl Registry {
             .values()
             .map(|v| v.enrollment.to_descriptor())
             .collect();
-        descriptors.sort_by(|a, b| a.id_pubkey_hex.cmp(&b.id_pubkey_hex));
+        Self::order_for_diversity_caps(&self.entries, &mut descriptors);
         // Bound how much of the directory any one subnet/operator can be, so an
         // open flood of relays can't buy a proportional share of path selection.
         let descriptors = apply_diversity_caps(descriptors);
@@ -986,5 +1030,91 @@ mod tests {
         let signed = r.build_signed(&authority, 3600).unwrap();
         assert_eq!(signed.doc.relays.len(), 3);
         signed.verify(&authority.verifying_key()).unwrap();
+    }
+
+    /// F-60 — a ground identity key must not evict an established relay.
+    ///
+    /// `apply_diversity_caps` keeps whatever comes FIRST in a full bucket, and
+    /// the input was sorted by `id_pubkey_hex` — the relay's own X25519 key,
+    /// which its operator generates freely. So an attacker grinds keys with a
+    /// low hex prefix and wins every contested bucket. With
+    /// `MAX_RELAYS_PER_24 = 3`, three VMs in a victim's /24 were enough to push
+    /// the honest relays out of the served directory.
+    #[test]
+    fn seniority_decides_a_full_bucket_not_a_low_identity_key() {
+        let mut reg = Registry::default();
+
+        // Three established relays in one /24, enrolled early. Their keys are
+        // high, as an honest randomly-generated key usually is.
+        for (i, key) in [0xF1u8, 0xF2, 0xF3].iter().enumerate() {
+            reg.enroll_at(
+                enrollment(
+                    &keyhex(*key),
+                    &format!("203.0.113.{}:443", 10 + i),
+                    RelayTier::Mix,
+                    1,
+                ),
+                1_000,
+            )
+            .unwrap();
+        }
+
+        // The attacker arrives later with ground keys: the lowest possible.
+        for (i, key) in [0x00u8, 0x01, 0x02].iter().enumerate() {
+            reg.enroll_at(
+                enrollment(
+                    &keyhex(*key),
+                    &format!("203.0.113.{}:443", 20 + i),
+                    RelayTier::Mix,
+                    1,
+                ),
+                2_000,
+            )
+            .unwrap();
+        }
+
+        let mut descriptors: Vec<RelayDescriptor> = reg
+            .entries
+            .values()
+            .map(|v| v.enrollment.to_descriptor())
+            .collect();
+        Registry::order_for_diversity_caps(&reg.entries, &mut descriptors);
+        let kept = crate::directory::apply_diversity_caps(descriptors);
+
+        // The bucket holds MAX_RELAYS_PER_24, and it holds the ESTABLISHED ones.
+        assert_eq!(kept.len(), crate::directory::MAX_RELAYS_PER_24);
+        for key in [0xF1u8, 0xF2, 0xF3] {
+            assert!(
+                kept.iter().any(|d| d.kem_pubkey_hex == keyhex(key)),
+                "an established relay was evicted by a ground key"
+            );
+        }
+        for key in [0x00u8, 0x01, 0x02] {
+            assert!(
+                !kept.iter().any(|d| d.kem_pubkey_hex == keyhex(key)),
+                "a late ground key must not take a contested slot"
+            );
+        }
+    }
+
+    /// Seniority must survive the heartbeat that refreshes an entry — carrying
+    /// it forward is the whole mechanism, and rebuilding it would make every
+    /// relay permanently brand new.
+    #[test]
+    fn a_heartbeat_does_not_reset_seniority() {
+        let mut reg = Registry::default();
+        reg.enroll_at(
+            enrollment(&keyhex(1), "203.0.113.7:443", RelayTier::Mix, 1),
+            1_000,
+        )
+        .unwrap();
+        reg.enroll_at(
+            enrollment(&keyhex(1), "203.0.113.7:443", RelayTier::Mix, 2),
+            9_000,
+        )
+        .unwrap();
+        let e = reg.entries.get(&keyhex(1)).unwrap();
+        assert_eq!(e.first_seen, 1_000, "seniority must not reset");
+        assert_eq!(e.last_seen, 9_000, "liveness must still advance");
     }
 }

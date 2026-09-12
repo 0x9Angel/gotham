@@ -15,6 +15,12 @@
 //! ship a 1-byte `hop_index` field in the header — it leaks the hop's
 //! position in the chain (bounded by `MAX_HOPS = 5`).
 //!
+//! That leak is not cosmetic (F-54): `hop_index == 0` tells the first relay its
+//! peer is the ORIGINAL SENDER rather than another relay, and `hop_count` tells
+//! every relay the path length. Sealed sender hides *who* is sending; these two
+//! bytes reveal *that* the peer is the sender at all. Removing them requires
+//! VERSION 3 — see the note on [`SphinxHeader::hop_index`].
+//!
 //! **β and the trailer are re-randomised at every hop (v0.2).** Each relay
 //! XORs the whole of β‖trailer with ChaCha20(`k_shuffle`) before forwarding,
 //! and the sender pre-compensates so each hop still finds its own slot. v0.1
@@ -236,9 +242,31 @@ pub struct Header {
     /// Anonymity mode (see [`mode`]).
     pub mode: u8,
     /// Total hop count `n` (`1 ≤ n ≤ MAX_HOPS`).
+    ///
+    /// **LEAKED IN CLEAR.** Combined with `hop_index` it tells a relay the whole
+    /// shape of the path it is on, and lets an exit recognise itself as the exit
+    /// before doing any work. See `hop_index`.
     pub hop_count: u8,
     /// Position of THIS hop in the chain (`0 ≤ hop_index < hop_count`).
-    /// **v0.1 leaks this 1 B** — fixed by `header_v2`.
+    ///
+    /// **LEAKED IN CLEAR — byte 3 of the encoded header (F-54).**
+    ///
+    /// The previous note here said "fixed by `header_v2`". It is not, and was
+    /// not: `encode` writes this byte in the plain meta region and `decode`
+    /// reads it back without any key. A comment asserting a property the code
+    /// does not have is worse than no comment, because it survives review.
+    ///
+    /// Concretely: a relay receiving `hop_index == 0` knows its peer is the
+    /// ORIGINAL SENDER, not another relay. That is the single fact a mixnet
+    /// exists to withhold from the first hop, and sealed sender does not help —
+    /// it hides *who* the sender is, while this reveals *that* the peer is one.
+    ///
+    /// Removing it needs a wire-format change (VERSION 3), where the fix is
+    /// either a shifting β — every hop reads slot 0, so no index has to exist —
+    /// or an index masked under a byte derived from `k_header`, readable only by
+    /// the hop that can do the DH. `hop_count` must go the same way; the
+    /// encrypted `IS_LAST_HOP` flag in the record already carries what the exit
+    /// legitimately needs.
     pub hop_index: u8,
     /// α — X25519 ephemeral pubkey for this hop.
     pub alpha: [u8; ALPHA_LEN],

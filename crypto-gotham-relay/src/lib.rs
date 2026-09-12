@@ -42,7 +42,7 @@ pub mod surb;
 pub mod transport;
 
 pub use client::{ClientError, GothamClient, MAX_PAYLOAD_SIZE};
-pub use cover_loop::{spawn_cover_loop, CoverLoopHandle, QueuedMessage};
+pub use cover_loop::{spawn_cover_loop, CoverLoopHandle, QueuedMessage, QueuedPacket};
 pub use delay::PoissonScheduler;
 pub use gossip::{spawn_gossip_loop, GossipConfig, GossipError, GossipNode};
 pub use mailbox_client::{fetch_auth_for, MailboxClient, MailboxClientError};
@@ -50,7 +50,7 @@ pub use pool::ConnectionPool;
 pub use process::{DropReason, ProcessOutcome, Relay};
 pub use rate_limit::{RateDecision, RateLimiter, ThrottleReason};
 pub use replay::{ReplayCache, ReplayCheck};
-pub use surb::{build_surb, ship_surb_reply, Surb, SurbError, SurbKeys};
+pub use surb::{build_surb, build_surb_with_delay, ship_surb_reply, Surb, SurbError, SurbKeys};
 pub use transport::{
     allow_unauthenticated_mailbox_fetch, make_mailbox_deposit_handler,
     make_mailbox_service_handler, make_unsealing_delivery_handler, run_relay_listener,

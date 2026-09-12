@@ -86,11 +86,33 @@ fn seed_from(l: &[u8], k: &[u8; 32]) -> [u8; 32] {
     seed
 }
 
-/// Encrypt `block` in place with the LIONESS PRP under `key`. `block.len()`
-/// must be at least [`MIN_BLOCK`]; shorter blocks are left untouched (the
-/// caller guarantees a full payload region, but we fail safe rather than panic).
+/// Encrypt `block` in place with the LIONESS PRP under `key`.
+///
+/// F-69 — a block shorter than [`MIN_BLOCK`] is ZEROED, not left alone.
+///
+/// The old branch returned without touching it, under a comment calling that
+/// "fail safe rather than panic". It is the opposite of safe: this function's
+/// entire job is to make the payload unreadable, and returning early leaves
+/// the caller holding PLAINTEXT that it believes is enciphered — and then
+/// ships it. Failing open in a cipher is the one direction that must never be
+/// chosen for convenience.
+///
+/// The branch is, today, unreachable: all eleven call sites pass either a
+/// `packet[HEADER_LEN..]` slice of a buffer already length-checked against
+/// `PACKET_SIZE`, or a freshly allocated region of exactly that size. So this
+/// costs nothing and exists for the day one of those invariants is edited —
+/// which is precisely when a silent no-op would be a plaintext leak nobody
+/// looks for. Destroying the block instead makes that day an obvious decrypt
+/// failure rather than a quiet disclosure.
 pub fn encrypt(key: &[u8; 32], block: &mut [u8]) {
     if block.len() < MIN_BLOCK {
+        // Zeroed, not asserted. A `debug_assert!` here would turn a broken
+        // caller invariant into a panic — and with `panic = "abort"` that is a
+        // crash, i.e. trading a confidentiality failure for an availability
+        // one on a path that runs for every packet. Destroying the block makes
+        // the failure loud where it matters (the decrypt fails) without giving
+        // an attacker who can reach this branch a way to kill the process.
+        block.fill(0);
         return;
     }
     let rk = round_keys(key);
@@ -106,9 +128,18 @@ pub fn encrypt(key: &[u8; 32], block: &mut [u8]) {
 }
 
 /// Decrypt `block` in place — the exact inverse of [`encrypt`] under the same
-/// `key`. Same length precondition as [`encrypt`].
+/// `key`. Same length precondition, and the same F-69 treatment: a short block
+/// is zeroed, so a broken caller invariant surfaces as a failed decrypt rather
+/// than as ciphertext handed on as if it were plaintext.
 pub fn decrypt(key: &[u8; 32], block: &mut [u8]) {
     if block.len() < MIN_BLOCK {
+        // Zeroed, not asserted. A `debug_assert!` here would turn a broken
+        // caller invariant into a panic — and with `panic = "abort"` that is a
+        // crash, i.e. trading a confidentiality failure for an availability
+        // one on a path that runs for every packet. Destroying the block makes
+        // the failure loud where it matters (the decrypt fails) without giving
+        // an attacker who can reach this branch a way to kill the process.
+        block.fill(0);
         return;
     }
     let rk = round_keys(key);
@@ -239,11 +270,23 @@ mod tests {
     }
 
     #[test]
-    fn short_block_is_left_untouched() {
+    fn a_short_block_is_destroyed_not_passed_through() {
+        // F-69 — this test used to assert the opposite: that a short block was
+        // "left untouched". Untouched means the caller ships PLAINTEXT it
+        // believes is enciphered, which is the one failure direction a cipher
+        // must never take for convenience. The branch is unreachable today;
+        // the point is what happens the day a caller's length invariant is
+        // edited, and then a silent no-op is a disclosure nobody looks for.
         let key = [9u8; 32];
         let mut block = vec![1u8; MIN_BLOCK - 1];
-        let original = block.clone();
         encrypt(&key, &mut block);
-        assert_eq!(block, original);
+        assert!(
+            block.iter().all(|b| *b == 0),
+            "a block too short to encipher must not survive as plaintext"
+        );
+
+        let mut block = vec![7u8; MIN_BLOCK - 1];
+        decrypt(&key, &mut block);
+        assert!(block.iter().all(|b| *b == 0));
     }
 }

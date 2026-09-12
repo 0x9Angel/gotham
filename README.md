@@ -18,14 +18,37 @@ Read this before anything else.
   anonymity set — the number of independent relays and the volume of unrelated
   traffic your messages hide in. A small deployment protects less than a large
   one. This is a property of the deployment, not a checkbox in the code.
-- It has **not been audited by an independent third party**. An internal
-  offensive audit was run (72 findings examined, 30 refuted by counter-analysis,
-  42 confirmed, 30 fixed with a regression test each, 12 documented as accepted
-  residuals). Internal is not independent.
+- It has **not been audited by an independent third party**. Two internal
+  campaigns have been run. July 2026: 72 findings examined, 30 refuted by
+  counter-analysis, 42 confirmed, 30 fixed with a regression test each. August
+  2026, after deduplication against the first: 71 findings, of which **46 are
+  fixed and tested**, 6 reduced with the residual written down, and **19 still
+  open** — including the one rated critical below. The real open count is
+  higher and is honestly unknown: twelve findings left open by the July
+  campaign were never folded back into the register, and since the register
+  already deduplicated the two campaigns, nobody can say how many of those
+  twelve are already counted. Somewhere between 19 and 31. Internal is not independent,
+  and a count of findings fixed says nothing about the ones nobody has looked
+  for yet.
+- **One critical finding is open.** The per-hop MAC authenticates only one slot
+  of the routing block, so two colluding relays can tag a packet on the way in
+  and recognise it on the way out. It is not exploitable while every relay is
+  run by the same operator — which is the case today — and it must be closed by
+  a wire-format change before third-party relays are admitted. If you are
+  considering running a relay, this is the finding to ask about.
 - Some known limitations are structural and written down in
-  [`docs/README.md`](docs/README.md) rather than quietly omitted. The routing
-  block β is byte-identical at every hop, which makes a packet correlatable
-  between two observation points; fixing it needs a wire-format change.
+  [`docs/README.md`](docs/README.md) rather than quietly omitted. One that used
+  to be listed here is no longer true and is corrected rather than quietly
+  dropped: β is **not** byte-identical between hops — it is re-randomised at
+  every hop, and a regression test covers every pair of hops. The open defect
+  is narrower and different: the per-hop MAC authenticates only one slot of the
+  routing block, which is the critical finding above.
+- **All three directory authorities are run by one person**, the author. The
+  2-of-3 quorum stops a single key from forging the relay list; it does not stop
+  a simultaneous seizure of all three hosts. Recruiting independent authority
+  operators is the network's declared first priority, and the reason it does not
+  yet route: path selection refuses two relays it cannot prove belong to
+  different operators, and there is only one.
 
 If you are evaluating this for anything where being wrong has consequences,
 start with the limitations, not the features.
@@ -50,11 +73,18 @@ start with the limitations, not the features.
 - **Sealed sender** — the entry relay does not learn who is sending.
 - **Enforced path diversity** — entry and exit may not share an operator, an
   IPv4 /16, or an IPv6 /48.
-- **Store-and-forward mailboxes** addressed by an opaque id, with a DH-MAC
+- **Store-and-forward mailboxes** addressed by a derived id, with a DH-MAC
   possession proof: holding a recipient's *public* key is not enough to read or
-  delete their mail.
+  delete their mail. The id is **not unlinkable**, and it would be wrong to
+  imply otherwise: it is a hash of the recipient's public key, and that key
+  travels in every invitation and every contact card. Anyone holding someone's
+  contact card can compute their mailbox id — and, from a seized relay, show
+  that this person received mail there and when.
 - **SURBs** — single-use reply blocks, so a recipient can collect mail without
-  revealing their IP to the host.
+  revealing their IP to the host. Implemented, but **not reachable on the
+  current fleet**: the anonymous fetch needs a routable path, and with too few
+  relays every fetch falls back to a direct connection in which the host does
+  see the recipient's IP. It starts working when the fleet can route.
 - **Rendezvous transport (RFC B3)** — a relay behind CGNAT (mobile, consumer
   ISP) joins with no inbound port and no public address at all.
 - **Signed directory** with anti-rollback, and **k-of-n admission** so no single

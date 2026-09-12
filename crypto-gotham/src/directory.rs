@@ -406,13 +406,67 @@ pub struct SelectedPath<'a> {
 /// Pick a path through the mesh subject to v0.1 diversity rules.
 pub struct PathSelector<'a> {
     relays: &'a [RelayDescriptor],
+    /// F-38 — the ENTRY GUARD set: `id_pubkey_hex` of the relays this client
+    /// is willing to use as its first hop. Empty means "any entry", which is
+    /// the pre-guard behaviour.
+    guards: &'a [String],
 }
 
 impl<'a> PathSelector<'a> {
     /// Wrap a slice of descriptors for path selection.
     #[must_use]
     pub fn new(relays: &'a [RelayDescriptor]) -> Self {
-        Self { relays }
+        Self {
+            relays,
+            guards: &[],
+        }
+    }
+
+    /// Restrict the ENTRY hop to a pinned set — Tor's entry-guard idea.
+    ///
+    /// F-38 — a fresh entry drawn uniformly for every packet is a guarantee of
+    /// eventual discovery, not a defence. A client that touches `k` of the `n`
+    /// entries at random meets an adversary-run one with probability
+    /// `1 - (1 - m/n)^k` — and at one packet per Poisson tick, `k` is roughly
+    /// 8640 a day. The question stops being *whether* an attacker sees this
+    /// client's real IP and becomes *when*, and "when" is hours.
+    ///
+    /// Pinning inverts it: the client either picked a hostile guard at the
+    /// start, with probability `m/n` and no repeats, or it never will. Same
+    /// reasoning Tor adopted in 2005 after exactly this analysis.
+    ///
+    /// Purely client-side — nothing about it appears on the wire.
+    #[must_use]
+    pub fn with_guards(mut self, guards: &'a [String]) -> Self {
+        self.guards = guards;
+        self
+    }
+
+    /// The entry pool this selector may draw from.
+    ///
+    /// Falls back to the full pool when the guards are unknown to the current
+    /// directory — a guard that has left the network must not take the client
+    /// offline. The caller detects that case by comparing the returned length
+    /// and rotates; failing closed here would turn one relay's retirement into
+    /// an outage for everyone who pinned it.
+    fn entry_pool<'p>(&self, entries: Vec<&'p RelayDescriptor>) -> Vec<&'p RelayDescriptor> {
+        if self.guards.is_empty() {
+            return entries;
+        }
+        let guarded: Vec<&RelayDescriptor> = entries
+            .iter()
+            .copied()
+            .filter(|r| {
+                self.guards
+                    .iter()
+                    .any(|g| g.eq_ignore_ascii_case(&r.id_pubkey_hex))
+            })
+            .collect();
+        if guarded.is_empty() {
+            entries
+        } else {
+            guarded
+        }
     }
 
     /// Pick one path with `hop_count` total hops (`3 ≤ hop_count ≤ 5`).
@@ -446,6 +500,7 @@ impl<'a> PathSelector<'a> {
             .iter()
             .filter(|r| r.tier == RelayTier::Entry && r.rendezvous.is_none())
             .collect();
+        let entries = self.entry_pool(entries);
         let mixes: Vec<&RelayDescriptor> = self
             .relays
             .iter()
@@ -573,6 +628,7 @@ impl<'a> PathSelector<'a> {
             .filter(|r| r.tier == RelayTier::Entry && r.rendezvous.is_none())
             .filter(|r| r.id_pubkey_hex != exit.id_pubkey_hex)
             .collect();
+        let entries = self.entry_pool(entries);
         let mixes: Vec<&RelayDescriptor> = self
             .relays
             .iter()
@@ -1245,8 +1301,37 @@ mod tests {
             high,
             "the current document must remain acceptable"
         );
-        // An expired document is still rejected on its own terms.
-        assert!(older.verify_monotonic(&pubkey, 0).is_ok());
+        // F-63 — this line used to read `assert!(older.verify_monotonic(&pubkey,
+        // 0).is_ok())` under the comment "an expired document is still
+        // rejected". `older` is not expired (the closure gives both documents
+        // `valid_until = now + 86_400`), and the assertion asserted the
+        // opposite of its comment: it re-proved that a high-water of 0
+        // constrains nothing, which the line above already showed.
+        //
+        // What needs proving is the INTERACTION: the validity window is
+        // checked inside `verify`, and the monotonic path must not short-
+        // circuit it. That window is the only thing bounding how far back a
+        // replayed directory can reach, so a bug there is unbounded rollback.
+        let mut stale = DirectoryDoc::new(
+            vec![fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1")],
+            std::time::Duration::from_secs(86_400),
+        )
+        .unwrap();
+        stale.valid_after = now - 172_800;
+        stale.valid_until = now - 86_400;
+        let stale = SignedDirectory::sign(stale, &signer).unwrap();
+        assert!(
+            stale.verify(&pubkey).is_err(),
+            "an expired directory must fail plain verification"
+        );
+        assert!(
+            stale.verify_monotonic(&pubkey, 0).is_err(),
+            "an expired directory must be refused whatever the high-water mark"
+        );
+        assert!(
+            stale.verify_monotonic(&pubkey, now - 172_800).is_err(),
+            "the high-water path must not short-circuit the validity window"
+        );
     }
 
     #[test]
@@ -1566,5 +1651,71 @@ mod tests {
             doc.relays, sorted,
             "doc.relays must be sorted by id_pubkey_hex"
         );
+    }
+
+    /// F-38 — the entry hop is PINNED, not re-drawn for every packet.
+    ///
+    /// A fresh uniform entry per packet guarantees eventual discovery rather
+    /// than preventing it: with ~8640 draws a day, meeting an adversary-run
+    /// entry stops being a question of whether and becomes one of when.
+    #[test]
+    fn entry_guards_pin_the_first_hop_and_degrade_gracefully() {
+        let mut r = rng();
+        // `fake_relay` derives the identity from the FIRST BYTE of the name,
+        // so the names must differ in that byte or every relay shares one
+        // identity — which is how the first draft of this test "passed" the
+        // guard assertions for the wrong reason.
+        let relays = vec![
+            fake_relay("a", RelayTier::Entry, [1, 1, 1, 1], "op1"),
+            fake_relay("b", RelayTier::Entry, [2, 2, 2, 2], "op2"),
+            fake_relay("c", RelayTier::Entry, [3, 3, 3, 3], "op3"),
+            fake_relay("m", RelayTier::Mix, [4, 4, 4, 4], "op4"),
+            fake_relay("n", RelayTier::Mix, [5, 5, 5, 5], "op5"),
+            fake_relay("x", RelayTier::Exit, [6, 6, 6, 6], "op6"),
+        ];
+        let guards = vec![relays[0].id_pubkey_hex.clone()];
+
+        // Every path starts at the guard, over enough draws that an unpinned
+        // selector would certainly have wandered.
+        for _ in 0..64 {
+            let path = PathSelector::new(&relays)
+                .with_guards(&guards)
+                .pick(&mut r, 3)
+                .expect("a guarded path must still be selectable");
+            assert_eq!(path.hops[0].id_pubkey_hex, relays[0].id_pubkey_hex);
+        }
+        // …and the same holds when the exit is forced (the mailbox path).
+        let exit = relays[5].clone();
+        for _ in 0..32 {
+            let path = PathSelector::new(&relays)
+                .with_guards(&guards)
+                .pick_to_exit(&mut r, 3, &exit)
+                .expect("a guarded path to a forced exit must be selectable");
+            assert_eq!(path.hops[0].id_pubkey_hex, relays[0].id_pubkey_hex);
+        }
+
+        // An unpinned selector really does wander — otherwise the assertions
+        // above would pass for the wrong reason.
+        let seen: std::collections::HashSet<String> = (0..64)
+            .filter_map(|_| PathSelector::new(&relays).pick(&mut r, 3).ok())
+            .map(|p| p.hops[0].id_pubkey_hex.clone())
+            .collect();
+        assert!(seen.len() > 1, "the unguarded selector must not be sticky");
+
+        // A guard that has LEFT the directory must not take the client
+        // offline: the pool falls back rather than failing closed. Failing
+        // closed here would turn one relay's retirement into an outage for
+        // everyone who happened to pin it.
+        let gone = vec!["deadbeef".to_string()];
+        assert!(PathSelector::new(&relays)
+            .with_guards(&gone)
+            .pick(&mut r, 3)
+            .is_ok());
+
+        // An empty guard set is the pre-guard behaviour, unchanged.
+        assert!(PathSelector::new(&relays)
+            .with_guards(&[])
+            .pick(&mut r, 3)
+            .is_ok());
     }
 }

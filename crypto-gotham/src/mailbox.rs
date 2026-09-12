@@ -163,6 +163,53 @@ pub fn mailbox_host_score(recipient_pubkey: &[u8], host_id: &[u8]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
+/// How long one mailbox-rendezvous epoch lasts.
+///
+/// Long enough that a normal client does not chase a moving host, short enough
+/// that ground keys go stale: an attacker who mines a key to win a named victim
+/// keeps them only until the epoch turns.
+pub const MAILBOX_EPOCH_SECS: u64 = 86_400;
+
+/// The epoch a signed directory document belongs to.
+///
+/// Derived from `valid_after` in the SIGNED document, never from local time:
+/// two peers must land on the same epoch without talking, and a local clock is
+/// something an attacker on the machine could nudge.
+pub fn mailbox_epoch_of(valid_after: u64) -> u64 {
+    valid_after / MAILBOX_EPOCH_SECS
+}
+
+const MAILBOX_RENDEZVOUS_DOMAIN_V2: &[u8] = b"gotham-mailbox-rendezvous-v2";
+
+/// Rendezvous score, salted by epoch.
+///
+/// F-15 — the unsalted score is a pure function of the victim's public key and
+/// a host id the operator CHOOSES. `host_id` is the relay's own X25519 key, so
+/// an attacker grinds keypairs until one wins the maximum for a named victim —
+/// around `m` trials for a fleet of `m` mailbox hosts, which is nothing. They
+/// then hold that victim's mailbox permanently: the depositor and the victim's
+/// own poll both converge on it, and the poll arrives from the victim's real
+/// IP carrying their public key, so the attacker gets `IP ↔ identity` and the
+/// sender↔recipient edge for as long as the fleet shape holds.
+///
+/// Mixing the epoch in makes a ground key win for at most one epoch, and the
+/// attacker cannot pre-compute the next one for a fleet they do not control
+/// the directory of. This is a CLIENT-side rule: the relay never computes a
+/// score — `FetchAuth::verify` only checks `mailbox_id_for(pk) == id` — so
+/// salting it changes nothing on the wire and needs no relay rollout.
+///
+/// `mailbox_id_for` is deliberately NOT salted: that IS the wire contract the
+/// deployed relays verify against, and changing it would need a versioned
+/// request and a coordinated rollout.
+pub fn mailbox_host_score_at(epoch: u64, recipient_pubkey: &[u8], host_id: &[u8]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(MAILBOX_RENDEZVOUS_DOMAIN_V2);
+    h.update(&epoch.to_le_bytes());
+    h.update(recipient_pubkey);
+    h.update(host_id);
+    *h.finalize().as_bytes()
+}
+
 /// One stored, sealed envelope with its expiry.
 #[derive(Clone, Debug)]
 struct Entry {
@@ -1002,5 +1049,69 @@ mod tests {
         assert_eq!(mb2.total(), 2, "the stale entry is dropped on restore");
         assert_eq!(mb2.pending(&id(1), 2 * HOUR), 1);
         assert_eq!(mb2.pending(&id(2), 2 * HOUR), 1);
+    }
+
+    /// F-15 — the rendezvous host must not be grindable for a named victim.
+    ///
+    /// `host_id` is the relay's own X25519 key, which its operator CHOOSES, so
+    /// with an unsalted score an attacker generates keypairs until one wins the
+    /// maximum for a victim they name — about `m` trials for a fleet of `m`
+    /// mailbox hosts. They then own that victim's mailbox for good: the
+    /// depositor and the victim's own poll both converge on it, and the poll
+    /// arrives from the victim's real IP carrying their public key.
+    #[test]
+    fn the_rendezvous_score_moves_with_the_epoch() {
+        let victim = [0x11u8; 32];
+        let hosts: Vec<[u8; 32]> = (0..8u8).map(|i| [i; 32]).collect();
+
+        let winner_at = |epoch: u64| -> usize {
+            hosts
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, h)| mailbox_host_score_at(epoch, &victim, h.as_slice()))
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+
+        // Stable within an epoch: the sender and the recipient must agree
+        // without talking, so this cannot be random.
+        assert_eq!(winner_at(100), winner_at(100));
+
+        // And it moves across epochs, so a ground key wins for one epoch only.
+        // Over a long run the winner must not be the same host every time.
+        let winners: std::collections::HashSet<usize> = (0..200).map(winner_at).collect();
+        assert!(
+            winners.len() > 1,
+            "the host must not be fixed for the life of a key"
+        );
+
+        // The epoch really is part of the input, not decoration.
+        assert_ne!(
+            mailbox_host_score_at(1, &victim, b"host"),
+            mailbox_host_score_at(2, &victim, b"host"),
+        );
+        // Different victims still land differently within one epoch — that is
+        // what keeps one operator from seeing the whole population.
+        assert_ne!(
+            mailbox_host_score_at(1, &victim, b"host"),
+            mailbox_host_score_at(1, &[0x22u8; 32], b"host"),
+        );
+        // v2 is domain-separated from the unsalted v1 score.
+        assert_ne!(
+            mailbox_host_score_at(0, &victim, b"host").to_vec(),
+            mailbox_host_score(&victim, b"host").to_vec(),
+        );
+    }
+
+    /// The epoch is derived from the SIGNED document, not from a local clock.
+    #[test]
+    fn the_epoch_comes_from_the_signed_validity_stamp() {
+        assert_eq!(mailbox_epoch_of(0), 0);
+        assert_eq!(mailbox_epoch_of(MAILBOX_EPOCH_SECS - 1), 0);
+        assert_eq!(mailbox_epoch_of(MAILBOX_EPOCH_SECS), 1);
+        // Two peers holding the same document derive the same epoch, which is
+        // the whole requirement: they must meet at a host without talking.
+        let valid_after = 1_757_000_000u64;
+        assert_eq!(mailbox_epoch_of(valid_after), mailbox_epoch_of(valid_after));
     }
 }

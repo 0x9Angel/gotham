@@ -36,9 +36,11 @@ compromised. Check the second possibility seriously before replying.
 - You cannot identify a user from a packet, and neither can we.
 
 Do not overstate this. If your relay runs a mailbox, it does hold encrypted
-envelopes on disk for up to 7 days, and it does hold the mailbox identifiers
-they are filed under. Say so if asked. A claim that turns out to be false is far
-worse for you than an inconvenient truth.
+envelopes on disk — **7 days by default and up to 30 in the worst case**, since
+the sender sets the lifetime and the relay only clamps it — and it does hold the
+mailbox identifiers they are filed under. Say so if asked, and say 30 rather than
+7 if you are asked for a maximum. A claim that turns out to be false is far worse
+for you than an inconvenient truth.
 
 ## Template: reply to a hosting provider
 
@@ -106,6 +108,33 @@ directory, and relay admission. Open an issue or contact the address in
 We would rather say "here is precisely what we can and cannot do" than promise a
 moderation capability that the architecture does not permit.
 
+**What has changed since this document was first written.** Because the publisher
+cannot read anything, the useful controls are the ones in the hands of the person
+being harmed — and those did not exist in August. They do now:
+
+- **Blocking.** A user can block a contact. Inbound envelopes from that peer are
+  refused *before* decryption, presence stops being broadcast to them, and a live
+  call is torn down. Blocking is a local decision; no relay is involved and the
+  blocked peer is not told.
+- **Reporting.** A user can record a report locally: a hash-chained journal
+  inside the encrypted database, signed **with the user's own key**. Be precise
+  about what that buys, because the distinction matters to anyone who takes it
+  to a lawyer: it is an *integrity* control, not proof of authorship. It shows
+  that an entry has not been altered after the fact relative to the rest of the
+  chain. It does **not** prove the peer wrote the quoted text, and it cannot
+  prove the owner did not compose the entry themselves — a signature made with
+  your own key is one you can always remake. Nothing is transmitted to the
+  publisher. It is a record the user controls, not a moderation queue and not a
+  forensic attestation.
+- **A written notice-and-action procedure**, as Article 16 of the EU Digital
+  Services Act requires, with response deadlines and a route to appeal. It also
+  states plainly what we cannot do, and points to the authorities that can act —
+  in France, PHAROS, plus 119 for a child at risk and 3018 for online harassment.
+
+None of this asks a relay operator to do anything, and none of it lets anyone —
+including us — read a message. It is here so that you can answer accurately if
+someone asks what recourse a victim has: the answer is no longer "nothing".
+
 ## Organisations that help relay operators
 
 - **Electronic Frontier Foundation** (US) — has long-standing guidance for Tor
@@ -117,5 +146,7 @@ moderation capability that the architecture does not permit.
 
 ---
 
-*Last reviewed 2026-08-03. If a claim here no longer matches the code, open an
-issue: an inaccurate FAQ is worse than none.*
+*Last reviewed 2026-09-12. If a claim here no longer matches the code, open an
+issue: an inaccurate FAQ is worse than none. This review corrected the mailbox
+retention figure — the ceiling is 30 days, not 7 — and added the recourse now
+available to users.*

@@ -80,6 +80,39 @@ impl CoverMode {
         1_000.0 / self.mean_interval_ms() as f64
     }
 
+    /// Mean per-hop mix delay the sender encodes, in microseconds.
+    ///
+    /// This is what actually buys mixing, and it used to be a single constant
+    /// of 20 ms for every mode. Twenty milliseconds is **below the jitter of an
+    /// ordinary internet path**, so an observer watching a relay's inbound and
+    /// outbound links could pair packets by arrival order without doing any
+    /// statistics at all: the mixnet charged four hops of latency and bought
+    /// nothing in return. Loopix, which this design follows, uses delays in the
+    /// hundreds of milliseconds to seconds for exactly this reason.
+    ///
+    /// Tying it to the mode makes the setting mean something. Before, choosing
+    /// "paranoid" only sent more cover packets; the mixing was identical to
+    /// low-latency. Now the mode trades latency for anonymity, which is what a
+    /// user picking it believes they are doing.
+    ///
+    /// Honest limit: delay alone does not create an anonymity set. Mixing
+    /// quality is roughly arrival-rate × hold-time, so on a fleet with few
+    /// relays and few users a packet may still transit largely alone. This
+    /// change removes a defect; it does not manufacture traffic that is not
+    /// there.
+    #[must_use]
+    pub fn mean_hop_delay_micros(self) -> u64 {
+        match self {
+            // ~400 ms added over a 4-hop path. Perceptible, still comfortable
+            // for typing, and finally above network jitter.
+            CoverMode::LowLatency => 100_000,
+            // ~2 s over 4 hops. Text messaging tolerates this easily.
+            CoverMode::Balanced => 500_000,
+            // ~8 s over 4 hops. For people who mean it.
+            CoverMode::Paranoid => 2_000_000,
+        }
+    }
+
     /// Adjust the mode for low-battery conditions: divide λ by 4 when
     /// battery is below the threshold and not charging.
     ///
@@ -109,8 +142,23 @@ pub enum CoverIntent {
     Real,
     /// No real traffic; send a dummy "drop" packet (sink relay drops it).
     Drop,
-    /// No real traffic; send a self-loop (round-trip back to sender).
-    /// Use sparingly — costs 2× bandwidth.
+    /// No real traffic; a self-loop — a packet routed back to the sender.
+    ///
+    /// **NOT IMPLEMENTED. F-55.** The only consumer,
+    /// `crypto_gotham_relay::cover_loop`, matches `Drop | Loop` in ONE arm and
+    /// emits a drop for both. Nothing is ever routed back and nothing is
+    /// awaited, so this variant costs 1× bandwidth, not 2×, and buys none of
+    /// what a self-loop is for.
+    ///
+    /// What it is for, and what the product therefore does NOT have: a loop
+    /// that fails to come back is evidence that someone is holding or dropping
+    /// this client's packets — the standard detector for an n-1 attack, for
+    /// flooding, and for a relay that silently blackholes. Emitting it as a
+    /// drop means the split below is a ratio with no observable effect.
+    ///
+    /// Left in the enum deliberately: removing it would erase the fact that
+    /// this detection is missing, and `intent_split_50_50_when_idle` would
+    /// then read as testing something real.
     Loop,
 }
 
@@ -193,6 +241,40 @@ impl CoverScheduler {
 
 #[cfg(test)]
 mod tests {
+    /// The defect this replaced: every mode mixed with the same 20 ms hold, so
+    /// choosing "paranoid" bought more cover packets and not one microsecond of
+    /// extra mixing. 20 ms also sits below ordinary internet jitter, which means
+    /// it added no uncertainty an observer had to resolve.
+    #[test]
+    fn the_mode_actually_changes_the_mix_delay() {
+        let low = CoverMode::LowLatency.mean_hop_delay_micros();
+        let bal = CoverMode::Balanced.mean_hop_delay_micros();
+        let par = CoverMode::Paranoid.mean_hop_delay_micros();
+
+        assert!(low < bal && bal < par, "the modes must be ordered");
+        assert!(
+            low >= 100_000,
+            "below ~100 ms the delay is lost in network jitter and buys nothing"
+        );
+        // The relay clamps a requested hold at 30 s (process.rs MAX_HOP_DELAY);
+        // asking for more would be silently truncated, so the user's choice
+        // would stop matching what the network does.
+        assert!(
+            par <= 30_000_000,
+            "a hop delay above the relay clamp is a lie"
+        );
+    }
+
+    /// Latency the user actually pays on a 4-hop path, so a change to these
+    /// numbers has to be made with the cost in view rather than by accident.
+    #[test]
+    fn end_to_end_latency_stays_usable() {
+        let four_hops = |m: CoverMode| m.mean_hop_delay_micros() * 4 / 1_000;
+        assert_eq!(four_hops(CoverMode::LowLatency), 400);
+        assert_eq!(four_hops(CoverMode::Balanced), 2_000);
+        assert_eq!(four_hops(CoverMode::Paranoid), 8_000);
+    }
+
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
@@ -296,6 +378,12 @@ mod tests {
         }
     }
 
+    /// F-55 — this pins the SPLIT, and the split is currently cosmetic.
+    ///
+    /// The scheduler really does emit Loop half the time; the consumer turns
+    /// both into a drop, so nothing downstream distinguishes them. Said here
+    /// because a green test named "50/50" invites the reader to conclude that
+    /// self-loops happen, which is the conclusion that let this sit.
     #[test]
     fn intent_split_50_50_when_idle() {
         let s = CoverScheduler::new(CoverMode::Balanced);

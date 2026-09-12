@@ -38,12 +38,17 @@ use crate::transport::{build_client_endpoint, forward_packet, TransportError};
 /// Maximum payload size that fits inside a single Gotham packet.
 pub const MAX_PAYLOAD_SIZE: usize = PACKET_SIZE - HEADER_LEN;
 
-/// Mean per-hop mix delay the sender encodes, in microseconds. Tracks the
-/// BALANCED mode target (20 ms) used by [`GothamClient::send`]. Each hop's
-/// actual hold is an independent Exp(λ) draw with this mean (Loopix
-/// sender-chosen delays), NOT a constant — a constant would be both a weak
-/// mix and a header fingerprint.
-const SENDER_MEAN_DELAY_MICROS: u64 = 20_000;
+/// Mean per-hop mix delay the sender encodes, in microseconds, when no cover
+/// mode has been supplied. Each hop's actual hold is an independent Exp(λ) draw
+/// with this mean (Loopix sender-chosen delays), NOT a constant — a constant
+/// would be both a weak mix and a header fingerprint.
+///
+/// This was 20 ms, which is below the jitter of an ordinary internet path: an
+/// observer watching a relay's two links could pair packets by arrival order
+/// with no statistics at all, so the mixnet cost latency and bought no mixing.
+/// It now tracks [`CoverMode::Balanced`], and callers who know the user's mode
+/// should pass it via [`GothamClient::with_hop_delay`] rather than rely on this.
+const SENDER_MEAN_DELAY_MICROS: u64 = 500_000;
 
 /// Sample one sender-chosen per-hop delay (µs) from Exp(λ), clamped to ≥ 1.
 /// `0` is reserved on the wire for "unset" — relays then fall back to their
@@ -75,6 +80,18 @@ pub struct GothamClient {
     #[zeroize(skip)]
     endpoint: Endpoint,
     client_sk: [u8; 32],
+    /// Mean per-hop delay this sender encodes, in microseconds. Set from the
+    /// user's `CoverMode` so that picking "paranoid" actually buys mixing
+    /// rather than only more cover packets.
+    #[zeroize(skip)]
+    mean_hop_delay_micros: u64,
+    /// F-38 — pinned ENTRY GUARDS (`id_pubkey_hex`), empty = any entry.
+    ///
+    /// A per-client property, like the delay above, so `send` and
+    /// `send_to_exit` keep their signatures and no caller can forget to pass
+    /// them — a guard set that half the send paths ignore is not a guard set.
+    #[zeroize(skip)]
+    entry_guards: Vec<String>,
 }
 
 impl GothamClient {
@@ -91,7 +108,36 @@ impl GothamClient {
         Ok(Self {
             endpoint,
             client_sk: sk,
+            mean_hop_delay_micros: SENDER_MEAN_DELAY_MICROS,
+            entry_guards: Vec::new(),
         })
+    }
+
+    /// Set the mean per-hop mix delay from the user's cover mode.
+    ///
+    /// Without this a client mixes at the Balanced rate whatever the user
+    /// chose, which is how the setting came to be cosmetic: "paranoid" sent
+    /// more cover packets but held them exactly as briefly.
+    #[must_use]
+    pub fn with_hop_delay(mut self, mean_micros: u64) -> Self {
+        // A zero mean would divide by zero in the Poisson draw, and on the wire
+        // 0 means "unset" — the relay would fall back to its own scheduler,
+        // silently discarding the user's choice.
+        self.mean_hop_delay_micros = mean_micros.max(1_000);
+        self
+    }
+
+    /// Pin the ENTRY GUARDS this client will use as its first hop (F-38).
+    ///
+    /// Empty restores "draw any entry", which is what every client did before:
+    /// a fresh entry per packet, ~8640 draws a day at Balanced, so meeting an
+    /// adversary-run entry stopped being a question of whether and became one
+    /// of when — measured in hours. Pinning makes the risk a one-time draw
+    /// instead of a repeated one.
+    #[must_use]
+    pub fn with_entry_guards(mut self, guards: Vec<String>) -> Self {
+        self.entry_guards = guards;
+        self
     }
 
     /// Send `payload` through a freshly-selected `hop_count`-hop path
@@ -123,6 +169,7 @@ impl GothamClient {
 
         // Select a diverse random path, then build + ship the onion.
         let path = PathSelector::new(relays)
+            .with_guards(&self.entry_guards)
             .pick(rng, hop_count)
             .map_err(|_| ClientError::PathSelection)?;
         self.ship_path(rng, &path, payload).await
@@ -147,6 +194,7 @@ impl GothamClient {
             return Err(ClientError::BadHopCount);
         }
         let path = PathSelector::new(relays)
+            .with_guards(&self.entry_guards)
             .pick_to_exit(rng, hop_count, exit)
             .map_err(|_| ClientError::PathSelection)?;
         self.ship_path(rng, &path, payload).await
@@ -179,7 +227,7 @@ impl GothamClient {
         // Sender-chosen Loopix delays: each hop's hold time is an independent
         // Exp(λ) draw (mean = mode target), encoded per record and honored by
         // the relay (see `process.rs`). Built once, sampled per hop.
-        let delay_sched = PoissonScheduler::new(SENDER_MEAN_DELAY_MICROS);
+        let delay_sched = PoissonScheduler::new(self.mean_hop_delay_micros);
         let mut records: Vec<RoutingRecord> = Vec::with_capacity(n);
         for i in 0..n {
             let mut rec = RoutingRecord::default();
@@ -328,6 +376,27 @@ impl GothamClient {
         sender_pk: &[u8; 32],
         body: &[u8],
     ) -> Result<(), ClientError> {
+        let framed = Self::frame_sealed_for_exit(rng, exit, sender_pk, body)?;
+        self.send_to_exit(rng, relays, hop_count, exit, &framed)
+            .await
+    }
+
+    /// Seal `body` for `exit` and length-frame it, WITHOUT sending.
+    ///
+    /// F-39 — split out of [`send_sealed_to_exit`] so a caller can build the
+    /// packet and hand it to the cover-traffic queue instead of shipping it
+    /// immediately. A mailbox deposit that goes out the moment the user
+    /// presses send is an off-cadence emission: the sealing hides the
+    /// depositor from the HOST, and does nothing about an observer on the
+    /// link, who reads the send instant straight off the packet clock. The
+    /// content is hidden and the fact that something was sent, right then, is
+    /// not — which is the metadata this product exists to protect.
+    pub fn frame_sealed_for_exit<R: CryptoRng + RngCore>(
+        rng: &mut R,
+        exit: &RelayDescriptor,
+        sender_pk: &[u8; 32],
+        body: &[u8],
+    ) -> Result<Vec<u8>, ClientError> {
         let exit_kem = exit
             .kem_pubkey_bytes()
             .map_err(|_| ClientError::BadDirectory("exit kem pk"))?;
@@ -339,8 +408,7 @@ impl GothamClient {
         if framed.len() > MAX_PAYLOAD_SIZE {
             return Err(ClientError::PayloadTooLarge);
         }
-        self.send_to_exit(rng, relays, hop_count, exit, &framed)
-            .await
+        Ok(framed)
     }
 }
 

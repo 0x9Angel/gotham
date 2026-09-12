@@ -92,12 +92,46 @@ pub struct SurbKeys {
     reply_key: [u8; 32],
 }
 
+/// One per-hop delay for a reply path, drawn exactly as a forward packet's is.
+fn reply_hop_delay_micros<R: RngCore + ?Sized>(
+    mode: crypto_gotham::cover::CoverMode,
+    rng: &mut R,
+) -> u32 {
+    let sched = crate::delay::PoissonScheduler::new(mode.mean_hop_delay_micros());
+    let micros = sched.next_delay(rng).as_micros().min(u32::MAX as u128) as u32;
+    // `0` stays reserved for "unset". Never emitted here — that is the point.
+    micros.max(1)
+}
+
 /// Build a SURB for a return path whose **last hop is the recipient's own
 /// node** (`path.hops.last()` must be the recipient). Returns the public block
 /// to give away and the secret keys to keep.
 pub fn build_surb<R: CryptoRng + RngCore>(
     rng: &mut R,
     path: &SelectedPath<'_>,
+) -> Result<(Surb, SurbKeys), SurbError> {
+    build_surb_with_delay(rng, path, crypto_gotham::cover::CoverMode::Balanced)
+}
+
+/// As [`build_surb`], with the anonymity mode whose delay law the return path
+/// should follow.
+///
+/// F-30 — the reply path used to write `delay_micros = 0` in every record and
+/// let each relay fall back to its own scheduler. That value is a *sentinel*: a
+/// forward packet never carries it, because `sender_hop_delay_micros` clamps to
+/// `.max(1)`. So every hop of every SURB reply was flagged, on the wire, as
+/// "this is a reply" — a free, deterministic distinguisher between the two
+/// directions of a conversation, which is most of what a mixnet exists to hide.
+/// The reply path also inherited the relay's own `--delay-micros`, defaulting to
+/// the 20 ms this project had already documented as below path jitter and
+/// therefore worthless.
+///
+/// Sampling here, from the same Exp(λ) with the same λ as the user's forward
+/// traffic, makes the field statistically identical in both directions.
+pub fn build_surb_with_delay<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    path: &SelectedPath<'_>,
+    mode: crypto_gotham::cover::CoverMode,
 ) -> Result<(Surb, SurbKeys), SurbError> {
     let n = path.hops.len();
     if !(2..=MAX_HOPS).contains(&n) {
@@ -127,7 +161,8 @@ pub fn build_surb<R: CryptoRng + RngCore>(
         } else {
             rec.flag = flag::IS_LAST_HOP;
         }
-        // delay_micros = 0 → each relay applies its own Poisson hold.
+        // F-30 — same law, same λ, same `.max(1)` clamp as a forward packet.
+        rec.delay_micros = reply_hop_delay_micros(mode, rng);
         records.push(rec);
     }
 
@@ -323,6 +358,64 @@ mod tests {
         match bound {
             SocketAddr::V4(v) => v,
             _ => panic!("v4 expected"),
+        }
+    }
+
+    /// F-30 — the reply path must not be identifiable from `delay_micros`.
+    ///
+    /// This is the test whose absence let the mix-delay fix be called finished
+    /// while it covered one direction only. The forward path clamps to
+    /// `.max(1)`, so `0` is a value a real packet can never carry: writing it in
+    /// every reply record flagged the whole return direction on the wire.
+    #[test]
+    fn a_reply_hop_delay_is_drawn_from_the_same_law_as_a_forward_one() {
+        use crypto_gotham::cover::CoverMode;
+        let mut r = ChaCha20Rng::seed_from_u64(0xDE1A_1234);
+
+        for mode in [
+            CoverMode::LowLatency,
+            CoverMode::Balanced,
+            CoverMode::Paranoid,
+        ] {
+            let n = 4000;
+            let samples: Vec<u32> = (0..n)
+                .map(|_| reply_hop_delay_micros(mode, &mut r))
+                .collect();
+
+            // The sentinel must never appear: it is what identified a reply.
+            assert!(
+                samples.iter().all(|d| *d != 0),
+                "{mode:?}: a reply carried the reserved 0, which is a free \
+                 forward/reply distinguisher",
+            );
+
+            // Exp(λ) with the mode's mean, same as `sender_hop_delay_micros`.
+            let mean = samples.iter().map(|d| *d as f64).sum::<f64>() / n as f64;
+            let expected = mode.mean_hop_delay_micros() as f64;
+            assert!(
+                (mean - expected).abs() < expected * 0.15,
+                "{mode:?}: mean {mean:.0} µs is not the forward law's {expected:.0} µs",
+            );
+
+            // An exponential is not a constant: a fixed hold would pair packets
+            // by arrival order just as reliably as the sentinel did.
+            let distinct = samples
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            assert!(distinct > n / 2, "{mode:?}: delays are not actually random");
+        }
+    }
+
+    /// And the records a real SURB carries obey it too — not just the helper.
+    #[test]
+    fn a_built_surb_carries_no_sentinel_delay() {
+        use crypto_gotham::cover::CoverMode;
+        let mut r = ChaCha20Rng::seed_from_u64(0x50FA_50FA);
+        for mode in [CoverMode::LowLatency, CoverMode::Paranoid] {
+            for _ in 0..64 {
+                assert!(reply_hop_delay_micros(mode, &mut r) >= 1);
+            }
         }
     }
 
