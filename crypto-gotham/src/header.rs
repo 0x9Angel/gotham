@@ -104,7 +104,15 @@ const _: () = assert!(MAX_HOPS == 5);
 /// would fail its MAC check. Rejecting on the version byte turns that into one
 /// clear error at the first hop instead of an unexplained BadMac in the middle
 /// of the path. Relays and clients must be rolled out together.
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
+
+/// The previous header version, still verifiable by a relay during a rollout.
+///
+/// F-01 — v2's per-hop MAC covered one slot of β, which is the tagging
+/// channel. A relay may accept v2 for a transition window so clients that
+/// have not updated keep working; every v2 packet it accepts is a packet the
+/// channel is open on, and the relay says so in its logs.
+pub const VERSION_LEGACY: u8 = 2;
 
 /// Anonymity modes (numeric values stable across versions).
 pub mod mode {
@@ -297,7 +305,10 @@ impl Header {
     /// out-of-range hop counters.
     pub fn decode(bytes: &[u8; HEADER_LEN]) -> Result<Self> {
         let version = bytes[0];
-        if version != VERSION {
+        // F-01 — v2 decodes so a relay CAN serve un-updated clients during a
+        // rollout. Whether it actually accepts one is a policy decision taken
+        // in `Relay::process`, not here: parsing a header is not trusting it.
+        if version != VERSION && version != VERSION_LEGACY {
             return Err(Error::Malformed("unsupported header version"));
         }
         let mode = bytes[1];
@@ -331,21 +342,53 @@ impl Header {
 
     /// MAC input for hop `slot_idx`.
     ///
-    /// Authenticates: `version || mode || hop_count || slot_idx || α || β[slot_idx] || trailer`.
-    /// Only the relevant slot of β is included — this allows each γ_i to
-    /// remain stable when other slots are subsequently updated by the
-    /// sender's wrap loop. Cross-slot integrity is provided per-hop: a
-    /// malicious upstream relay rewriting slot[j] (j > i) cannot forge
-    /// γ_j, so the downstream hop drops the packet.
+    /// **VERSION 3** authenticates
+    /// `version || mode || hop_count || slot_idx || α || β[slot_idx ..] || trailer`
+    /// — this hop's slot AND every slot after it.
+    ///
+    /// **VERSION 2 covered only `β[slot_idx]`, and that was F-01, the one
+    /// finding rated critical.** The reasoning written here was that
+    /// cross-slot integrity is provided per hop, "a malicious upstream relay
+    /// rewriting slot[j] (j > i) cannot forge γ_j, so the downstream hop drops
+    /// the packet". True, and beside the point: the downstream hop in question
+    /// is the attacker's own colluding exit, which simply does not drop it. An
+    /// entry relay writes a mark into the exit's slot, the exit reads it back
+    /// byte for byte, and the packet routes correctly the whole way. That is a
+    /// deterministic entry↔exit correlation on a SINGLE packet — no timing, no
+    /// statistics, no traffic volume needed.
+    ///
+    /// Covering the suffix closes it because the first HONEST hop after the
+    /// tagger has that slot inside its own MAC and drops the packet. There is
+    /// no circularity: `wrap_header` runs its loop from `n-1` down to `0`, so
+    /// when γ_i is computed, slots `i..n` are already final and slots
+    /// `n..MAX_HOPS` hold the random filler from step 2. Slot `i-1` is a
+    /// PREFIX and is deliberately excluded — it is written afterwards.
+    ///
+    /// The unused slots `n..MAX_HOPS` becoming authenticated is not incidental:
+    /// under v2 they were covered by nobody, so an adjacent pair of relays
+    /// could signal through them with no MAC failure occurring anywhere.
+    ///
+    /// **Residual, stated rather than implied:** two ADJACENT colluding relays
+    /// can still tag, because the tagger's immediate successor is the reader
+    /// and ignores its own MAC failure. On a 3-hop path that is entry+middle or
+    /// middle+exit — neither of which links sender to recipient. Closing that
+    /// too means rebuilding β as a shifting stream with deterministic filler.
     fn mac_input_for_slot(&self, slot_idx: usize) -> Vec<u8> {
-        let mut v = Vec::with_capacity(4 + ALPHA_LEN + RECORD_LEN + TRAILER_LEN);
+        let start = slot_idx * RECORD_LEN;
+        let slot_bytes: &[u8] = if self.version >= 3 {
+            &self.beta[start..]
+        } else {
+            // Legacy v2 verification, kept ONLY so a relay can serve clients
+            // that have not updated yet. See `Relay::accept_header_v2`.
+            &self.beta[start..start + RECORD_LEN]
+        };
+        let mut v = Vec::with_capacity(4 + ALPHA_LEN + slot_bytes.len() + TRAILER_LEN);
         v.push(self.version);
         v.push(self.mode);
         v.push(self.hop_count);
         v.push(slot_idx as u8);
         v.extend_from_slice(&self.alpha);
-        let start = slot_idx * RECORD_LEN;
-        v.extend_from_slice(&self.beta[start..start + RECORD_LEN]);
+        v.extend_from_slice(slot_bytes);
         v.extend_from_slice(&self.trailer);
         v
     }
@@ -1014,8 +1057,21 @@ mod tests {
         ));
     }
 
+    /// F-01 — a tamper in a LATER slot is caught IMMEDIATELY, not "downstream".
+    ///
+    /// This test used to be called `cross_slot_tamper_caught_downstream` and
+    /// asserted that hops 0 and 1 accept a packet whose slot 2 has been
+    /// altered, with only hop 2 rejecting it. That was the v2 behaviour, and
+    /// it was the critical finding: the hop that "catches it downstream" is
+    /// the attacker's own colluding exit, which does not catch anything — it
+    /// reads the mark and forwards the packet. A test asserting that the
+    /// tamper travels undetected through every honest hop is a test that
+    /// encodes the vulnerability as the specification.
+    ///
+    /// Under v3 each hop's MAC covers its own slot and every slot after it,
+    /// so hop 0 refuses at once.
     #[test]
-    fn cross_slot_tamper_caught_downstream() {
+    fn cross_slot_tamper_is_caught_at_the_first_honest_hop() {
         // Tampering with slot 2 doesn't break hop 0's MAC (by design — γ_i
         // covers only slot[i]), but DOES break hop 2's MAC.
         let mut r = rng();
@@ -1034,30 +1090,18 @@ mod tests {
             trailer,
         )
         .unwrap();
-        // Flip a bit in slot 2.
+        // Flip a bit in slot 2 — a later hop's slot, which is exactly what a
+        // tagging entry relay does.
         header.beta[2 * RECORD_LEN + 5] ^= 0x40;
 
-        // Hop 0 succeeds (its slot is slot 0, untampered).
+        // Hop 0 REFUSES: slot 2 is inside its MAC now.
         let (sk0, _) = &relays[0];
         let shared0 = sk0.diffie_hellman(&X25519PublicKey::from(header.alpha));
         let hop_sub0 = derive_hop_subkeys(shared0.as_bytes()).unwrap();
-        let outcome0 = unwrap_header(&header, &hop_sub0).expect("hop 0 should succeed");
-        // Forward to hop 1.
-        let header1 = outcome0.next_header;
-        // Hop 1 also succeeds (its slot is slot 1, untampered).
-        let (sk1, _) = &relays[1];
-        let shared1 = sk1.diffie_hellman(&X25519PublicKey::from(header1.alpha));
-        let hop_sub1 = derive_hop_subkeys(shared1.as_bytes()).unwrap();
-        let outcome1 = unwrap_header(&header1, &hop_sub1).expect("hop 1 should succeed");
-        // Hop 2 fails (its slot 2 is tampered).
-        let header2 = outcome1.next_header;
-        let (sk2, _) = &relays[2];
-        let shared2 = sk2.diffie_hellman(&X25519PublicKey::from(header2.alpha));
-        let hop_sub2 = derive_hop_subkeys(shared2.as_bytes()).unwrap();
-        assert!(matches!(
-            unwrap_header(&header2, &hop_sub2),
-            Err(Error::BadMac)
-        ));
+        assert!(
+            matches!(unwrap_header(&header, &hop_sub0), Err(Error::BadMac)),
+            "a tamper in a later slot must be caught by the first hop to see it"
+        );
     }
 
     #[test]

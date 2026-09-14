@@ -34,6 +34,13 @@ const UPNP_LEASE_SECS: u32 = 3600;
 /// what `systemd stop`, launchd, and Windows-service shims send — so a
 /// service-manager stop unwinds cleanly (the final mailbox snapshot is
 /// persisted) instead of being hard-killed. On non-Unix it awaits Ctrl-C.
+///
+/// On Windows this covers Ctrl-C only. A relay installed by `install-relay.ps1`
+/// runs as a Scheduled Task, and stopping that task terminates the process
+/// without a signal — so the final mailbox and replay-cache snapshots below do
+/// not run there. The periodic saves bound the loss to one interval; the same
+/// gap has always applied to the mailbox. Closing it needs a Windows console
+/// control handler, which is a separate piece of work.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -145,6 +152,34 @@ enum Cmd {
         /// TTL of replay cache entries, seconds.
         #[arg(long, default_value_t = 300)]
         replay_ttl_secs: u64,
+
+        /// Keep the replay cache across restarts, at this path (F-25).
+        ///
+        /// Without it the cache lives only in RAM: a restart forgets every
+        /// packet this relay has seen, and one captured beforehand and
+        /// replayed after is accepted as fresh. That is a confirmation attack
+        /// for the price of waiting for an upgrade window. The file holds γ
+        /// MACs and timestamps only — no addresses, no payloads — but read
+        /// LOGGING-POLICY.md before enabling it on a machine that might be
+        /// seized: it does record that SOME packet passed, and when.
+        #[arg(long)]
+        replay_cache_path: Option<PathBuf>,
+
+        /// Refuse headers built with the v2 MAC construction (F-01).
+        ///
+        /// v2 authenticates ONE slot of the routing block, which is the tagging
+        /// channel: an entry relay marks the exit's slot, a colluding exit
+        /// reads it back, and the packet still routes. Off by default so
+        /// clients that have not updated keep working; turn it on once every
+        /// client this relay serves emits VERSION 3 — with it on, every packet
+        /// from an un-updated client is dropped.
+        ///
+        /// The relay logs loudly while it is off and v2 traffic arrives. The
+        /// first build shipped that log message naming this flag before the
+        /// flag existed; an operator who followed it took their relay down on
+        /// `unexpected argument`. It exists now.
+        #[arg(long, default_value_t = false)]
+        strict_header_v3: bool,
 
         /// Max inbound packets/sec before shedding (token bucket, burst =
         /// 2×). Protects CPU and connection from a flood. `0` = unlimited.
@@ -850,6 +885,8 @@ async fn main() -> std::io::Result<()> {
             delay_micros,
             replay_size,
             replay_ttl_secs,
+            replay_cache_path,
+            strict_header_v3,
             max_pps,
             max_bytes_per_day,
             authority_url,
@@ -878,15 +915,33 @@ async fn main() -> std::io::Result<()> {
         } => {
             let sk = read_key_file(&key_file)?;
             let advertise_for_gossip = advertise_addr.clone();
-            let relay = Relay::new(
+            let mut relay = Relay::new(
                 sk,
                 replay_size,
                 Duration::from_secs(replay_ttl_secs),
                 delay_micros,
             )
             .with_rate_limit(max_pps, max_bytes_per_day);
-
+            if strict_header_v3 {
+                relay = relay.strict_header_v3();
+                info!("strict header v3: refusing v2 headers (F-01 tagging channel closed)");
+            }
+            if let Some(path) = replay_cache_path.clone() {
+                relay = relay.with_replay_persistence(path);
+            } else {
+                warn!(
+                    "replay cache is memory-only: a restart forgets every packet seen and \
+                     reopens the replay window. Set --replay-cache-path to keep it."
+                );
+            }
             let pk_hex = hex::encode(relay.identity_public_key());
+            // Shared from here on: the listener runs it, and `main` keeps a
+            // handle for the final replay-cache save at shutdown (F-25) — the
+            // one save that must not be left to a background task, because
+            // returning from `main` drops the runtime and abandons the task
+            // wherever it stands. Measured: a detached shutdown save lost the
+            // race roughly one time in three on a loaded host.
+            let relay = Arc::new(Mutex::new(relay));
 
             // The authority's stable PoP public key (if pinned via
             // --authority-pop-key). Used BOTH to build the enrollment possession
@@ -1080,15 +1135,15 @@ async fn main() -> std::io::Result<()> {
             tokio::select! {
                 res = async {
                     if let Some((r_addr, r_pk)) = rendezvous_dial {
-                        crypto_gotham_relay::transport::run_rendezvous_relay(
-                            r_addr, r_pk, sk, relay, mailbox_delivery,
+                        crypto_gotham_relay::transport::run_rendezvous_relay_shared(
+                            r_addr, r_pk, sk, Arc::clone(&relay), mailbox_delivery,
                         )
                         .await
                     } else {
                         info!(%listen_addr, "binding QUIC listener");
-                        crypto_gotham_relay::run_relay_listener_with_services(
-                            listen_addr, sk, relay, mailbox_delivery, mailbox_handle.clone(),
-                            gossip_service, authority_pop_pk,
+                        crypto_gotham_relay::run_relay_listener_with_services_shared(
+                            listen_addr, sk, Arc::clone(&relay), mailbox_delivery,
+                            mailbox_handle.clone(), gossip_service, authority_pop_pk,
                         )
                         .await
                     }
@@ -1108,6 +1163,17 @@ async fn main() -> std::io::Result<()> {
                 if let Err(e) = persist_mailbox(path, &snap) {
                     warn!(?e, "failed to persist mailbox on shutdown");
                 }
+            }
+
+            // Final replay-cache snapshot (F-25). Synchronous, and HERE, on
+            // purpose: this future is the one `#[tokio::main]` is blocked on,
+            // so the write, the fsync and the rename all complete before the
+            // runtime is dropped. It also covers the path where the listener
+            // returned with an error rather than a signal arriving.
+            match relay.lock().await.persist_replay() {
+                Some(Ok(n)) => info!(entries = n, "replay cache persisted on shutdown"),
+                Some(Err(e)) => warn!(error = %e, "could not persist the replay cache on shutdown"),
+                None => {}
             }
 
             Ok(())

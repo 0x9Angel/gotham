@@ -19,7 +19,7 @@ use std::time::Duration;
 use crypto_gotham::header::{derive_hop_subkeys, unwrap_header, Header, HEADER_LEN, RECORD_LEN};
 use crypto_gotham::Error as GothamError;
 use rand::{CryptoRng, RngCore};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use x25519_dalek::{x25519, StaticSecret};
 use zeroize::ZeroizeOnDrop;
 
@@ -99,6 +99,30 @@ pub struct Relay {
     scheduler: PoissonScheduler,
     #[zeroize(skip)]
     rate_limiter: RateLimiter,
+    /// F-01 — accept headers still using the v2 MAC construction.
+    ///
+    /// v2 authenticates one slot of the routing block, which IS the tagging
+    /// channel: an entry relay marks the exit's slot, a colluding exit reads
+    /// it back, and the packet routes correctly. Accepting v2 keeps clients
+    /// that have not updated working, at the cost of leaving that channel open
+    /// for them. It defaults to ON so a relay upgrade does not cut off the
+    /// installed base, and the relay says loudly that it is on — turn it off
+    /// with `--strict-header-v3` once clients have moved.
+    #[zeroize(skip)]
+    accept_header_v2: bool,
+    /// How many v2 packets this relay has accepted. Logged once at the first
+    /// one and periodically after, so "the window is still open" is visible
+    /// rather than inferred.
+    #[zeroize(skip)]
+    v2_accepted: u64,
+    /// F-25 — where the replay cache is kept across restarts.
+    ///
+    /// `None` keeps the old behaviour: the cache is RAM-only and a restart
+    /// forgets every γ this relay has seen, reopening the replay window to its
+    /// full width. An attacker does not need to cause the restart — upgrades,
+    /// reboots and crashes provide them.
+    #[zeroize(skip)]
+    replay_path: Option<std::path::PathBuf>,
     identity_sk: [u8; 32],
 }
 
@@ -119,7 +143,68 @@ impl Relay {
             replay_cache: ReplayCache::new(replay_max_size, replay_ttl),
             scheduler: PoissonScheduler::new(mean_delay_micros),
             rate_limiter: RateLimiter::unlimited(),
+            accept_header_v2: true,
+            v2_accepted: 0,
+            replay_path: None,
         }
+    }
+
+    /// Keep the replay cache on disk at `path`, loading it now (F-25).
+    ///
+    /// Loading happens here rather than lazily so a corrupt or unreadable
+    /// snapshot is reported at start-up, when an operator is watching, instead
+    /// of silently leaving the relay with an empty cache it believes is warm.
+    #[must_use]
+    pub fn with_replay_persistence(mut self, path: std::path::PathBuf) -> Self {
+        match crate::replay::persist::load(&mut self.replay_cache, &path) {
+            Ok(n) => tracing::info!(entries = n, path = %path.display(), "replay cache restored"),
+            Err(e) => tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "replay cache could not be read — starting EMPTY, so packets seen \
+                 before this restart will be accepted again until the TTL refills",
+            ),
+        }
+        self.replay_path = Some(path);
+        self
+    }
+
+    /// Encode the replay cache for persistence, with its destination path.
+    ///
+    /// In-memory only, so it is cheap enough to run under the relay lock on
+    /// the packet path. The caller writes the bytes OUTSIDE the lock — a full
+    /// cache is ~24 MB plus an fsync, and the first version held the lock
+    /// through all of it, stalling forwarding for ~100 ms every minute while
+    /// its own comment said the opposite.
+    pub fn encode_replay(&self) -> Option<(Vec<u8>, std::path::PathBuf)> {
+        let path = self.replay_path.clone()?;
+        Some((crate::replay::persist::encode(&self.replay_cache), path))
+    }
+
+    /// Write the replay cache to its configured path, synchronously.
+    ///
+    /// For the final save at shutdown, where blocking until the bytes are on
+    /// disk is the point. The periodic task uses `encode_replay` instead.
+    pub fn persist_replay(&self) -> Option<std::io::Result<usize>> {
+        let path = self.replay_path.as_ref()?;
+        Some(crate::replay::persist::save(&self.replay_cache, path))
+    }
+
+    /// `true` if this relay keeps its replay cache across restarts.
+    #[must_use]
+    pub fn persists_replay(&self) -> bool {
+        self.replay_path.is_some()
+    }
+
+    /// Refuse headers built with the v2 MAC construction (F-01).
+    ///
+    /// Flip this once the clients a relay serves have updated. Until then the
+    /// tagging channel is open for every v2 packet it carries — which is why
+    /// the relay logs the count rather than letting the window be forgotten.
+    #[must_use]
+    pub fn strict_header_v3(mut self) -> Self {
+        self.accept_header_v2 = false;
+        self
     }
 
     /// Attach an inbound rate limiter (packets/sec ceiling + rolling daily
@@ -181,6 +266,28 @@ impl Relay {
             Ok(h) => h,
             Err(_) => return ProcessOutcome::Drop(DropReason::Malformed),
         };
+
+        // ── 1b. Header version policy (F-01) ──────────────────────────────
+        //
+        // `decode` parses v2 so this decision can be taken here rather than
+        // buried in a parser. A v2 header's MAC covers one slot of the routing
+        // block, which is the tagging channel; accepting it is a deliberate
+        // compatibility choice with a real cost, so it is counted and said out
+        // loud rather than being silently permanent.
+        if header.version == crypto_gotham::header::VERSION_LEGACY {
+            if !self.accept_header_v2 {
+                debug!("dropped: legacy v2 header refused (strict mode)");
+                return ProcessOutcome::Drop(DropReason::Malformed);
+            }
+            self.v2_accepted = self.v2_accepted.saturating_add(1);
+            if self.v2_accepted == 1 || self.v2_accepted.is_multiple_of(10_000) {
+                warn!(
+                    accepted = self.v2_accepted,
+                    "serving LEGACY v2 headers — the F-01 tagging channel is open for these \
+                     packets. Pass --strict-header-v3 once the clients you serve have updated."
+                );
+            }
+        }
 
         // ── 2. Derive per-hop sub-keys (X25519 DH) ────────────────────────
         let shared = x25519(self.identity_sk, header.alpha);

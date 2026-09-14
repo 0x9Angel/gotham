@@ -353,11 +353,10 @@ impl SignedDirectory {
 
         // Transitively expand the trust set over the verified edge list (HashSet
         // lookups only, no crypto): start at the pinned key and follow each
-        // old→new edge until the set stops growing or the actual signer becomes
-        // trusted (early exit — no need to expand further once it is reachable).
+        // old→new edge until the set stops growing.
         let mut trusted: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         trusted.insert(pinned.to_bytes());
-        while !trusted.contains(&actual) {
+        loop {
             let mut grew = false;
             for (old_pub, new_pub) in &edges {
                 if trusted.contains(old_pub) && trusted.insert(*new_pub) {
@@ -369,6 +368,84 @@ impl SignedDirectory {
             }
         }
 
+        // A FORK is proof of compromise. An honest authority designates exactly
+        // one successor per key; a key that appears as the certifier of two
+        // DIFFERENT successors has signed for an attacker at least once, and we
+        // cannot tell which edge is the honest one — the transition carries no
+        // epoch to order them by. Refuse the whole chain rather than guess.
+        //
+        // Scoped to keys we TRUST, and checked after the expansion for that
+        // reason. The first version of this check ran over every edge in the
+        // list, and the list is server-supplied: anyone holding three keys of
+        // their own can mint `X→Y` and `X→Z`, both of which verify (each is
+        // signed by X and by its successor), and slipping them in refused a
+        // perfectly legitimate directory. A fork from a key nobody trusts is
+        // noise, not evidence; a fork from a key we DO trust is the attack.
+        //
+        // This is what closes the published shape of the attack ([A→B, A→EVIL]
+        // served together). It does NOT close the case where the attacker
+        // withholds A→B and serves [A→EVIL] alone to a client pinned at A: from
+        // that client's view, A simply rotated once. Closing that needs either
+        // a persisted anchor (the client remembers it adopted B, and refuses to
+        // re-derive from A) or a successor certificate co-signed by more than
+        // the retiring key — both are the wire-format work the register files
+        // under F-23/F-26, and neither is in this change.
+        {
+            let mut successor: std::collections::HashMap<[u8; 32], [u8; 32]> =
+                std::collections::HashMap::new();
+            for (old_pub, new_pub) in edges.iter().filter(|(o, _)| trusted.contains(o)) {
+                if let Some(prev) = successor.insert(*old_pub, *new_pub) {
+                    if prev != *new_pub {
+                        return Err(Error::Directory(
+                            "forked authority key transition: a trusted key certifies two successors",
+                        ));
+                    }
+                }
+            }
+        }
+
+        // F-26 — a key that has been rotated AWAY from may no longer SIGN.
+        //
+        // The set above was previously used as-is, and the early exit stopped
+        // expanding the moment `actual` became reachable. Both were wrong in
+        // the same direction: the pinned key went in unconditionally and
+        // nothing ever took it out, so after a rotation the OLD key kept
+        // signing directories that every client accepted.
+        //
+        // Be precise about what this buys, because the first version of this
+        // comment overstated it. A superseded key is refused as a SIGNER of
+        // directories. It is NOT stripped of the power to CERTIFY a successor:
+        // the fork check above catches it doing so twice, but a leaked key
+        // whose honest rotation is withheld from the client still mints one
+        // successor that client accepts. So this handles a LOST key and a
+        // stale directory replayed against a client that already holds the
+        // transition; it does not, by itself, contain a COMPROMISED key. That
+        // containment is the k-of-n co-signature + persisted anchor work.
+        //
+        // Superseding is authority-only: an edge needs the OLD key's signature
+        // as well as the new one (`AuthorityKeyTransition::verify`), so nobody
+        // can revoke a key they do not already hold — no denial of service.
+        //
+        // Two self-inflicted shapes to know about, both requiring the
+        // authority's own keys and therefore not attacks. A cycle (A→B, B→A)
+        // supersedes BOTH and locks every key out of signing. And once a
+        // successor is lost there is no way back: the predecessor can neither
+        // sign (superseded) nor certify a replacement (that would fork). Both
+        // are fixed by the same epoch + co-signature work as the rest of the
+        // F-26 residual, and until then the operational rule is: keep the
+        // predecessor offline, never rotate back.
+        //
+        // The early exit had to go with it: expansion must run to the fixpoint,
+        // or a key superseded by an edge we stopped short of reading would
+        // still be accepted. The work stays bounded by MAX_TRANSITIONS.
+        let superseded: std::collections::HashSet<[u8; 32]> =
+            edges.iter().map(|(old_pub, _)| *old_pub).collect();
+
+        if superseded.contains(&actual) {
+            return Err(Error::Directory(
+                "authority pubkey has been rotated away from: superseded key",
+            ));
+        }
         if !trusted.contains(&actual) {
             return Err(Error::Directory(
                 "authority pubkey not trusted: no rotation chain from the pinned key",
@@ -976,8 +1053,16 @@ impl AuthorityKeyTransition {
         b
     }
 
-    /// Build a transition certifying `new` as the successor of `old`. Sign this
-    /// with the OFFLINE/HSM-held old key, then rotate the online signer to `new`.
+    /// Build a transition certifying `new` as the successor of `old`. Sign it
+    /// with the OFFLINE/HSM-held old key.
+    ///
+    /// **Order of operations, and it is not the obvious one.** Switch the
+    /// online signer to `new` FIRST, then publish this transition. Publishing
+    /// it while `old` is still signing directories refuses every client for
+    /// the length of the window: the transition retires `old` as a signer the
+    /// moment a client reads it, and `new` has not signed anything yet. The
+    /// earlier wording here said to publish first, which prescribed exactly
+    /// that outage.
     pub fn build(old: &SigningKey, new: &SigningKey) -> Self {
         let old_pub = old.verifying_key().to_bytes();
         let new_pub = new.verifying_key().to_bytes();
@@ -1160,6 +1245,164 @@ mod tests {
         signed
             .verify_with_transitions(&old.verifying_key(), std::slice::from_ref(&t))
             .expect("rotated key trusted via transition");
+    }
+
+    /// F-26 — rotating away from a key must actually RETIRE it.
+    ///
+    /// This is the half that made the mechanism cosmetic: the pinned key went
+    /// into the trust set unconditionally and nothing removed it, so a key
+    /// rotated away from — the one being rotated precisely because it is
+    /// suspect — kept signing directories every client accepted.
+    #[test]
+    fn a_superseded_authority_key_is_refused() {
+        let old = SigningKey::from_bytes(&[1u8; 32]);
+        let new = SigningKey::from_bytes(&[2u8; 32]);
+        let t = AuthorityKeyTransition::build(&old, &new);
+
+        let r1 = fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1");
+        let doc = DirectoryDoc::new(vec![r1], std::time::Duration::from_secs(86_400)).unwrap();
+
+        // The OLD key signs a directory and presents the very transition that
+        // retired it. Before the fix this verified: the pinned key was trusted
+        // unconditionally and the rotation was pure decoration.
+        let by_old = SignedDirectory::sign(doc.clone(), &old).unwrap();
+        assert!(
+            by_old
+                .verify_with_transitions(&old.verifying_key(), std::slice::from_ref(&t))
+                .is_err(),
+            "a key that has been rotated away from must not sign directories",
+        );
+
+        // The successor still works — revocation must not break rotation.
+        let by_new = SignedDirectory::sign(doc, &new).unwrap();
+        by_new
+            .verify_with_transitions(&old.verifying_key(), std::slice::from_ref(&t))
+            .expect("the successor key is the live one");
+    }
+
+    /// Along a chain A → B → C, only C signs. B is both reachable and
+    /// superseded, and reachability used to win because expansion stopped as
+    /// soon as the signer was found — so a mid-chain key stayed valid forever.
+    #[test]
+    fn a_mid_chain_authority_key_is_refused() {
+        let a = SigningKey::from_bytes(&[1u8; 32]);
+        let b = SigningKey::from_bytes(&[2u8; 32]);
+        let c = SigningKey::from_bytes(&[3u8; 32]);
+        let chain = vec![
+            AuthorityKeyTransition::build(&a, &b),
+            AuthorityKeyTransition::build(&b, &c),
+        ];
+
+        let r1 = fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1");
+        let doc = DirectoryDoc::new(vec![r1], std::time::Duration::from_secs(86_400)).unwrap();
+
+        for (key, name) in [(&a, "the original"), (&b, "the intermediate")] {
+            let signed = SignedDirectory::sign(doc.clone(), key).unwrap();
+            assert!(
+                signed
+                    .verify_with_transitions(&a.verifying_key(), &chain)
+                    .is_err(),
+                "{name} key was superseded and must be refused",
+            );
+        }
+
+        let signed = SignedDirectory::sign(doc, &c).unwrap();
+        signed
+            .verify_with_transitions(&a.verifying_key(), &chain)
+            .expect("only the end of the chain signs");
+    }
+
+    /// A key that certifies two different successors has signed for an
+    /// attacker at least once. With no epoch to order the edges, the honest
+    /// one cannot be told from the forged one — refuse the whole chain.
+    ///
+    /// This is the published shape of the attack the review found: A leaks,
+    /// the attacker serves [A→B, A→EVIL] with a directory signed by EVIL.
+    /// Before this check, `trusted = {A, B, EVIL}` and it verified.
+    #[test]
+    fn a_forked_transition_chain_is_refused_outright() {
+        let a = SigningKey::from_bytes(&[1u8; 32]);
+        let b = SigningKey::from_bytes(&[2u8; 32]);
+        let evil = SigningKey::from_bytes(&[9u8; 32]);
+        let chain = vec![
+            AuthorityKeyTransition::build(&a, &b),
+            AuthorityKeyTransition::build(&a, &evil),
+        ];
+
+        let r1 = fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1");
+        let doc = DirectoryDoc::new(vec![r1], std::time::Duration::from_secs(86_400)).unwrap();
+
+        for (key, who) in [
+            (&evil, "the forged successor"),
+            (&b, "the honest successor"),
+        ] {
+            let signed = SignedDirectory::sign(doc.clone(), key).unwrap();
+            assert!(
+                signed
+                    .verify_with_transitions(&a.verifying_key(), &chain)
+                    .is_err(),
+                "a forked chain must be refused even for {who}: the fork itself is the evidence",
+            );
+        }
+        // The same edge listed twice is not a fork.
+        let dup = vec![
+            AuthorityKeyTransition::build(&a, &b),
+            AuthorityKeyTransition::build(&a, &b),
+        ];
+        SignedDirectory::sign(doc, &b)
+            .unwrap()
+            .verify_with_transitions(&a.verifying_key(), &dup)
+            .expect("a duplicated edge is redundant, not contradictory");
+    }
+
+    /// The list of transitions is server-supplied. A fork among keys NOBODY
+    /// trusts must not refuse a legitimate directory — the first version of the
+    /// fork check was global, and two junk edges from any attacker-held key
+    /// were enough to deny every client its directory.
+    #[test]
+    fn a_fork_among_untrusted_keys_is_noise_not_a_refusal() {
+        let a = SigningKey::from_bytes(&[1u8; 32]);
+        let b = SigningKey::from_bytes(&[2u8; 32]);
+        // Three keys the attacker simply generated. Both edges verify.
+        let x = SigningKey::from_bytes(&[7u8; 32]);
+        let y = SigningKey::from_bytes(&[8u8; 32]);
+        let z = SigningKey::from_bytes(&[9u8; 32]);
+        let chain = vec![
+            AuthorityKeyTransition::build(&x, &y),
+            AuthorityKeyTransition::build(&a, &b),
+            AuthorityKeyTransition::build(&x, &z),
+        ];
+
+        let r1 = fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1");
+        let doc = DirectoryDoc::new(vec![r1], std::time::Duration::from_secs(86_400)).unwrap();
+        SignedDirectory::sign(doc, &b)
+            .unwrap()
+            .verify_with_transitions(&a.verifying_key(), &chain)
+            .expect("junk edges from keys we never trusted must not deny service");
+    }
+
+    /// The honest limit of the mechanism, pinned so nobody reads more into it:
+    /// a client pinned at A that is shown ONLY [A→EVIL] accepts EVIL. There is
+    /// nothing in the transition to say A had already rotated elsewhere. This
+    /// is the case that needs a persisted anchor or a co-signed certificate,
+    /// and this test exists to fail the day either lands, so the comment and
+    /// the register get updated with it.
+    #[test]
+    fn a_withheld_rotation_still_lets_a_leaked_key_mint_one_successor() {
+        let a = SigningKey::from_bytes(&[1u8; 32]);
+        let evil = SigningKey::from_bytes(&[9u8; 32]);
+        let only_evil = vec![AuthorityKeyTransition::build(&a, &evil)];
+
+        let r1 = fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1");
+        let doc = DirectoryDoc::new(vec![r1], std::time::Duration::from_secs(86_400)).unwrap();
+        let signed = SignedDirectory::sign(doc, &evil).unwrap();
+        assert!(
+            signed
+                .verify_with_transitions(&a.verifying_key(), &only_evil)
+                .is_ok(),
+            "KNOWN LIMIT — if this starts failing, the containment landed: update \
+             directory.rs's F-26 comment and the register's F-26 residual",
+        );
     }
 
     #[test]

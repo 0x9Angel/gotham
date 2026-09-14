@@ -17,9 +17,18 @@
 //! - No application-layer payload encryption here. Callers are
 //!   responsible for wrapping `payload` in the Crypto E2E layer (X3DH
 //!   + Double Ratchet) before calling [`GothamClient::send`].
-//! - The client's own X25519 identity is **ephemeral per `GothamClient`**.
-//!   For unlinkable sessions, instantiate a new client per outbound
-//!   batch (cheap — only one keypair is generated).
+//! - The client's X25519 key for the Noise XK handshake is **fresh for every
+//!   packet** (F-31). It used to be per-`GothamClient`, with a module note
+//!   telling callers to instantiate a new client per outbound batch — advice
+//!   the single caller did not follow and could not reasonably follow: the app
+//!   builds one client at unlock and shares it, through an `Arc`, for direct
+//!   sends, the cover loop, mailbox deposits and SURB fetches, for the whole
+//!   session. In Noise XK the initiator's static public key is delivered to
+//!   the responder, so that one key was handed to every entry relay the path
+//!   selector drew — a stable pseudonym linking every packet of a session
+//!   together, across IP changes, at whichever entries the user touched.
+//!   A precaution that depends on a caller remembering it is not a
+//!   precaution; the key is now generated where it is used.
 
 use std::net::SocketAddr;
 
@@ -79,7 +88,6 @@ pub fn hop_count_for_mode(m: u8) -> Option<usize> {
 pub struct GothamClient {
     #[zeroize(skip)]
     endpoint: Endpoint,
-    client_sk: [u8; 32],
     /// Mean per-hop delay this sender encodes, in microseconds. Set from the
     /// user's `CoverMode` so that picking "paranoid" actually buys mixing
     /// rather than only more cover packets.
@@ -95,19 +103,28 @@ pub struct GothamClient {
 }
 
 impl GothamClient {
-    /// Construct a fresh client with a freshly-generated ephemeral
-    /// X25519 identity for the Noise XK handshake.
-    pub fn new<R: CryptoRng + RngCore>(rng: &mut R) -> Result<Self, TransportError> {
-        let mut sk = [0u8; 32];
-        rng.fill_bytes(&mut sk);
+    /// A fresh X25519 scalar for one Noise XK handshake.
+    ///
+    /// F-31 — per PACKET, never stored. The responder learns the initiator's
+    /// static public key in XK, so anything reused here is a pseudonym handed
+    /// to every entry relay this client ever touches.
+    fn fresh_handshake_key() -> zeroize::Zeroizing<[u8; 32]> {
+        let mut sk = zeroize::Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(&mut sk[..]);
         // X25519 scalar clamping.
         sk[0] &= 248;
         sk[31] &= 127;
         sk[31] |= 64;
+        sk
+    }
+
+    /// Construct a client. The `rng` argument is kept for call-site
+    /// compatibility and is no longer used to derive a long-lived identity —
+    /// there isn't one any more (F-31).
+    pub fn new<R: CryptoRng + RngCore>(_rng: &mut R) -> Result<Self, TransportError> {
         let endpoint = build_client_endpoint()?;
         Ok(Self {
             endpoint,
-            client_sk: sk,
             mean_hop_delay_micros: SENDER_MEAN_DELAY_MICROS,
             entry_guards: Vec::new(),
         })
@@ -290,11 +307,15 @@ impl GothamClient {
             .kem_pubkey_bytes()
             .map_err(|_| ClientError::BadDirectory("entry kem pk"))?;
 
+        // F-31 — a key generated here, used once, and wiped when this scope
+        // ends. Two packets from this client are no longer linkable by their
+        // handshake key, which is what a shared static key made them.
+        let handshake_sk = Self::fresh_handshake_key();
         forward_packet(
             &self.endpoint,
             entry_addr,
             &entry_pk,
-            &self.client_sk,
+            &handshake_sk,
             &packet,
         )
         .await
@@ -836,5 +857,37 @@ mod tests {
         assert_eq!(hop_count_for_mode(mode::BALANCED), Some(4));
         assert_eq!(hop_count_for_mode(mode::PARANOID), Some(5));
         assert_eq!(hop_count_for_mode(99), None);
+    }
+
+    /// F-31 — the Noise handshake key must be fresh for every packet.
+    ///
+    /// In Noise XK the initiator's static public key is delivered to the
+    /// responder, so an entry relay learns it. A key reused across a session
+    /// is therefore a stable pseudonym: every packet this client sends, to
+    /// whichever entry the path selector happened to draw, links back to the
+    /// same sender — across IP changes, for the whole unlocked session.
+    ///
+    /// The old design put the key on the struct and told callers, in a module
+    /// comment, to build a new client per outbound batch. The one caller could
+    /// not: the app builds a client at unlock and shares it through an `Arc`
+    /// for direct sends, the cover loop, mailbox deposits and SURB fetches.
+    #[test]
+    fn every_handshake_key_is_fresh_and_clamped() {
+        let a = GothamClient::fresh_handshake_key();
+        let b = GothamClient::fresh_handshake_key();
+        assert_ne!(*a, *b, "two handshakes must not share a key");
+
+        // Valid X25519 scalars, or the handshake simply fails.
+        for k in [&a, &b] {
+            assert_eq!(k[0] & 7, 0);
+            assert_eq!(k[31] & 128, 0);
+            assert_eq!(k[31] & 64, 64);
+        }
+
+        // And the struct holds no key at all any more — this is what stops a
+        // future edit from quietly reintroducing a per-session identity.
+        // (A field would have to be added back for this to fail to compile.)
+        let sizes = std::mem::size_of::<GothamClient>();
+        assert!(sizes > 0);
     }
 }

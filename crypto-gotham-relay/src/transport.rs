@@ -1402,6 +1402,47 @@ pub async fn forward_packet(
 /// does not run the normal listener; instead it dials its rendezvous relay R,
 /// keeps the tunnel warm, and processes every packet R pushes to it — peeling
 /// its Sphinx layer and forwarding onward over its OWN outbound (which NAT
+/// F-25 — keep the replay cache on disk while the relay runs.
+///
+/// Periodic, and ONLY periodic. The first version also tried to save from a
+/// second SIGTERM listener inside this task; that raced `main`'s own listener,
+/// which returns from `#[tokio::main]` and drops the runtime — measured, the
+/// save lost the race on a loaded host roughly one time in three. The final
+/// save now lives in `main`, on the task that decides to exit, where it cannot
+/// be abandoned. This task's job is the steady state: a CRASH loses at most
+/// one interval.
+///
+/// The lock is held only for the in-memory encode. The write — up to ~24 MB
+/// and an fsync — runs on the blocking pool, off the relay mutex and off the
+/// runtime worker, so forwarding never waits on the disk.
+fn spawn_replay_persistence(relay: Arc<Mutex<Relay>>) {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+    tokio::spawn(async move {
+        if !relay.lock().await.persists_replay() {
+            return;
+        }
+        let mut ticker = tokio::time::interval(INTERVAL);
+        // The interval's first tick fires immediately, and that first save is
+        // deliberate: a relay stopped inside its first minute — a crash loop
+        // under `Restart=always` — must still leave a snapshot behind.
+        loop {
+            ticker.tick().await;
+            let Some((buf, path)) = relay.lock().await.encode_replay() else {
+                return;
+            };
+            let written = tokio::task::spawn_blocking(move || {
+                crate::replay::persist::write_encoded(&buf, &path)
+            })
+            .await;
+            match written {
+                Ok(Ok(n)) => debug!(entries = n, "replay cache persisted"),
+                Ok(Err(e)) => warn!(error = %e, "could not persist the replay cache"),
+                Err(e) => warn!(error = %e, "replay persistence task panicked"),
+            }
+        }
+    });
+}
+
 /// permits). Runs until aborted.
 pub async fn run_rendezvous_relay(
     r_addr: SocketAddr,
@@ -1410,10 +1451,25 @@ pub async fn run_rendezvous_relay(
     relay: Relay,
     delivery: Option<DeliveryHandler>,
 ) -> Result<(), TransportError> {
+    run_rendezvous_relay_shared(r_addr, r_pk, my_sk, Arc::new(Mutex::new(relay)), delivery).await
+}
+
+/// [`run_rendezvous_relay`] over a relay the caller keeps a handle to.
+///
+/// The daemon needs the handle for the final replay-cache save at shutdown
+/// (F-25): that save must run on the task that decides to exit, which is
+/// `main`, and `main` cannot reach a relay this module wrapped for it.
+pub async fn run_rendezvous_relay_shared(
+    r_addr: SocketAddr,
+    r_pk: [u8; 32],
+    my_sk: [u8; 32],
+    relay: Arc<Mutex<Relay>>,
+    delivery: Option<DeliveryHandler>,
+) -> Result<(), TransportError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = build_client_endpoint()?;
     let pool = Arc::new(ConnectionPool::new(client, my_sk));
-    let relay = Arc::new(Mutex::new(relay));
+    spawn_replay_persistence(Arc::clone(&relay));
     let (tx, rx) = tokio::sync::mpsc::channel(crate::rendezvous::RENDEZVOUS_INBOUND_QUEUE);
     info!(r = %r_addr, "starting as a CGNAT (rendezvous-hosted) relay — inbound via R only");
     tokio::spawn(crate::rendezvous::run_rendezvous_client(
@@ -1520,9 +1576,32 @@ pub async fn run_relay_listener_with_services(
     gossip: Option<GossipService>,
     authority_pop_pk: Option<[u8; 32]>,
 ) -> Result<(), TransportError> {
+    run_relay_listener_with_services_shared(
+        listen_addr,
+        static_sk,
+        Arc::new(Mutex::new(relay)),
+        delivery,
+        mailbox,
+        gossip,
+        authority_pop_pk,
+    )
+    .await
+}
+
+/// [`run_relay_listener_with_services`] over a relay the caller keeps a handle
+/// to — see [`run_rendezvous_relay_shared`] for why the daemon needs one.
+pub async fn run_relay_listener_with_services_shared(
+    listen_addr: SocketAddr,
+    static_sk: [u8; 32],
+    relay: Arc<Mutex<Relay>>,
+    delivery: Option<DeliveryHandler>,
+    mailbox: Option<Arc<Mutex<Mailbox>>>,
+    gossip: Option<GossipService>,
+    authority_pop_pk: Option<[u8; 32]>,
+) -> Result<(), TransportError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let server = build_server_endpoint(listen_addr)?;
-    serve_endpoint_with_services(
+    serve_endpoint_with_services_shared(
         server,
         static_sk,
         relay,
@@ -1587,9 +1666,32 @@ pub async fn serve_endpoint_with_services(
     // (fail-closed), which is correct for a relay that never hosts rendezvous.
     authority_pop_pk: Option<[u8; 32]>,
 ) -> Result<(), TransportError> {
+    serve_endpoint_with_services_shared(
+        endpoint,
+        static_sk,
+        Arc::new(Mutex::new(relay)),
+        delivery,
+        mailbox,
+        gossip,
+        authority_pop_pk,
+    )
+    .await
+}
+
+/// [`serve_endpoint_with_services`] over a relay the caller keeps a handle to
+/// — see [`run_rendezvous_relay_shared`] for why the daemon needs one.
+pub async fn serve_endpoint_with_services_shared(
+    endpoint: Endpoint,
+    static_sk: [u8; 32],
+    relay: Arc<Mutex<Relay>>,
+    delivery: Option<DeliveryHandler>,
+    mailbox: Option<Arc<Mutex<Mailbox>>>,
+    gossip: Option<GossipService>,
+    authority_pop_pk: Option<[u8; 32]>,
+) -> Result<(), TransportError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = build_client_endpoint()?;
-    let relay = Arc::new(Mutex::new(relay));
+    spawn_replay_persistence(Arc::clone(&relay));
     let pool = Arc::new(ConnectionPool::new(client, static_sk));
     let bound = endpoint.local_addr().ok();
     info!(
