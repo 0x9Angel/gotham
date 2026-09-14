@@ -145,6 +145,9 @@ if ($Mode -eq "rendezvous") {
         "run", "--key-file", $Key,
         "--listen-host", "0.0.0.0", "--listen-port", $Port,
         "--authority-url", $AuthUrl, "--tier", $Tier, "--heartbeat-secs", "60",
+        # F-25: keep the replay cache across restarts, or a reboot forgets
+        # every packet seen and a captured packet replayed after is new.
+        "--replay-cache-path", (Join-Path $Dir "replay.bin"),
         "--rendezvous-key", $rp.kem_pubkey_hex, "--rendezvous-addr", $rp.addr
     ) + $CommonArgs
     $AdvMsg = "via rendezvous $($rp.addr) (CGNAT/B3)"
@@ -157,6 +160,9 @@ if ($Mode -eq "rendezvous") {
         "run", "--key-file", $Key,
         "--listen-host", "0.0.0.0", "--listen-port", $Port,
         "--authority-url", $AuthUrl, "--tier", $Tier, "--heartbeat-secs", "60",
+        # F-25: keep the replay cache across restarts, or a reboot forgets
+        # every packet seen and a captured packet replayed after is new.
+        "--replay-cache-path", (Join-Path $Dir "replay.bin"),
         "--advertise-addr", "$($AdvIp):$Port"
     ) + $CommonArgs
     $AdvMsg = "$($AdvIp):$Port"

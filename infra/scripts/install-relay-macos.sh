@@ -174,6 +174,10 @@ $ADVERTISE_XML
 $TOKEN_XML
     <string>--tier</string><string>$TIER</string>
     <string>--heartbeat-secs</string><string>60</string>
+    <!-- F-25: keep the replay cache across restarts. Without it a restart
+         forgets every packet this relay has seen, and a packet captured
+         beforehand and replayed after is accepted as new. -->
+    <string>--replay-cache-path</string><string>$STATE_DIR/replay.bin</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

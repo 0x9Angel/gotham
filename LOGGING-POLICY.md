@@ -15,7 +15,10 @@ seizure of that machine would expose.
 At the default log level, a relay records **no user IP addresses** and **no
 message content**. What it holds that matters is the mailbox: sealed envelopes
 waiting to be collected, on disk, for up to 7 days by default — and up to 30 if
-the sender asks for it.
+the sender asks for it. It also keeps its replay-protection set on disk — opaque
+per-packet MACs with timestamps, the last few minutes only, owner-readable —
+so a restart does not reopen the replay window. See "Replay protection" below
+for exactly what that file does and does not say.
 
 ## Logs
 
@@ -94,8 +97,34 @@ Your two real levers are:
 ## Replay protection
 
 The relay keeps a bounded, time-limited set of recently seen packet identifiers
-to reject replays (`replay.rs`). It is in memory, bounded in both size and time.
-It is not a traffic log and is not written to disk.
+to reject replays (`replay.rs`). Each entry is the packet's 16-byte per-hop MAC
+and the second it was seen. Nothing else: no address, no size, no next hop, no
+content. Entries expire after `--replay-ttl-secs` (300 by default).
+
+**As of this version the installers keep that set on disk**, at
+`--replay-cache-path` (`/opt/gotham/state/replay.bin` on Linux). This is a
+security change, not a logging one, and it is worth being precise about both
+halves.
+
+Why it exists: the set used to live only in memory, so every restart — an
+upgrade, a reboot, a crash — forgot every packet the relay had seen. A packet
+captured before the restart and replayed after it was accepted as new. Replay
+detection that stops working across restarts is not replay detection, and the
+restarts are not something an attacker has to cause; they happen on their own.
+
+What the file is, and is not: it is a list of opaque 16-byte values with
+timestamps, covering at most the last few minutes, owner-only (`0600`), written
+atomically, and read once at start. It does record that *some* packet passed
+through this relay at a given second. It does not record whose, from where, or
+to where — the MAC is not linkable to a sender, a recipient or a message by
+anyone who does not already hold the packet. On a seized machine it says "this
+relay carried traffic at these seconds", which the fact of running a relay
+already says.
+
+If you would rather hold nothing at all at rest, drop `--replay-cache-path`
+from the service definition. The relay then logs, once at start, that its
+replay protection will not survive a restart. That is the trade you are
+making, and it is yours to make.
 
 ## What we deliberately do not do
 
@@ -106,10 +135,11 @@ It is not a traffic log and is not written to disk.
 ## If you want less
 
 You can run a relay with the mailbox disabled. It will still forward traffic and
-still be useful, and it will hold nothing at rest beyond its own keys. If
-storing other people's encrypted mail on your disk is not something you are
-comfortable with, this is the honest option and nobody will think less of you
-for it.
+still be useful, and it will hold nothing at rest beyond its own keys and the
+replay set described above — drop `--replay-cache-path` too and it is the keys
+alone. If storing other people's encrypted mail on your disk is not something
+you are comfortable with, this is the honest option and nobody will think less
+of you for it.
 
 A middle path, if you do want to help offline delivery: keep `--mailbox` and
 drop `--mailbox-store`. The mailbox is then memory-only — useful while your

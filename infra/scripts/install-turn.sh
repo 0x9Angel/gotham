@@ -59,6 +59,23 @@ fi
 chmod 600 "${SECRET_FILE}"
 SECRET="$(cat "${SECRET_FILE}")"
 
+# ── Which address can this machine actually bind? ────────────────────────────
+# The route to the internet tells us which interface (and therefore which
+# address) the kernel would use. On a cloud instance that is the private one.
+LOCAL_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+if [[ -z "${LOCAL_IP}" ]]; then
+  LOCAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+fi
+if [[ -z "${LOCAL_IP}" ]]; then
+  echo "[!] Could not determine this host's own IP address."
+  echo "    Set it explicitly:  GOTHAM_LOCAL_IP=<address> $0 ..."
+  exit 1
+fi
+LOCAL_IP="${GOTHAM_LOCAL_IP:-${LOCAL_IP}}"
+if [[ "${LOCAL_IP}" != "${EXTERNAL_IP}" ]]; then
+  echo "▸ Behind 1:1 NAT: binding ${LOCAL_IP}, advertising ${EXTERNAL_IP}."
+fi
+
 # ── Install coturn ───────────────────────────────────────────────────────────
 echo "▸ Installing coturn…"
 export DEBIAN_FRONTEND=noninteractive
@@ -72,8 +89,26 @@ echo "▸ Writing ${CONF}…"
   echo "# Managed by install-turn.sh — Gotham private-call TURN. Do not hand-edit."
   echo "listening-port=3478"
   echo "listening-ip=0.0.0.0"
-  echo "relay-ip=${EXTERNAL_IP}"
-  echo "external-ip=${EXTERNAL_IP}"
+  # relay-ip must be an address this machine ACTUALLY HOLDS.
+  #
+  # Every mainstream cloud (Oracle, Azure, GCP, AWS) puts the public address on
+  # a NAT in front of the instance: the interface only ever carries a private
+  # 10.x/172.16.x/192.168.x. Writing the PUBLIC address here makes coturn try to
+  # bind every port of its relay range to an address that does not exist
+  # locally, and it fails all of them with errno=99 (EADDRNOTAVAIL). The server
+  # still answers the first Allocate with a challenge, then goes silent — so it
+  # looks alive from outside while no allocation can ever succeed. No relay
+  # candidate is gathered, and with relay-only calls that means no candidate at
+  # all: the callee waits on "no candidate pairs" and the caller sits at zero.
+  #
+  # external-ip takes the PUBLIC/PRIVATE mapping so the addresses coturn
+  # advertises stay the reachable ones.
+  echo "relay-ip=${LOCAL_IP}"
+  if [[ "${LOCAL_IP}" == "${EXTERNAL_IP}" ]]; then
+    echo "external-ip=${EXTERNAL_IP}"
+  else
+    echo "external-ip=${EXTERNAL_IP}/${LOCAL_IP}"
+  fi
   echo "realm=${REALM}"
   echo "server-name=${REALM}"
   echo

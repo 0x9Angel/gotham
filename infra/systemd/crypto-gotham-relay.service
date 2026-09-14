@@ -14,6 +14,16 @@ WorkingDirectory=/opt/gotham
 # reads GOTHAM_ENROLL_TOKEN from the environment; the rest are passed as flags.
 # Note: $GOTHAM_EXTRA_ARGS uses no braces on purpose so systemd word-splits it
 # into separate optional flags (--country / --operator); empty = no extra flags.
+#
+# --delay-micros is deliberately NOT passed. This unit used to pin it to 20000,
+# which silently undid the F-30 fix on every deployed relay: 20 ms sits below
+# the jitter of an ordinary internet path, so the hold cost latency and bought
+# no mixing at all. The binary's own default (500 ms, the Balanced mean) is the
+# value that mixes — let it apply. Do not re-add the flag.
+#
+# --replay-cache-path keeps the replay cache across restarts (F-25). Without it
+# a restart forgets every packet seen and a captured packet replayed afterwards
+# is accepted as fresh. The file lives under the existing ReadWritePaths below.
 EnvironmentFile=/etc/gotham/relay.env
 ExecStart=/opt/gotham/bin/gotham-relay run \
     --key-file /opt/gotham/state/relay.key \
@@ -21,9 +31,9 @@ ExecStart=/opt/gotham/bin/gotham-relay run \
     --authority-url ${GOTHAM_AUTHORITY_URL} \
     --advertise-addr ${GOTHAM_ADVERTISE_ADDR} \
     --tier ${GOTHAM_TIER} \
-    --delay-micros 20000 \
     --replay-size 1000000 \
     --replay-ttl-secs 300 \
+    --replay-cache-path /opt/gotham/state/replay.bin \
     $GOTHAM_EXTRA_ARGS
 Restart=always
 RestartSec=5

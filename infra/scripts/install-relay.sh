@@ -8,17 +8,27 @@
 # build: it downloads the prebuilt, checksum-verified relay binary and wires up
 # auto-enrollment so the relay joins the network on its own.
 #
-# USAGE (run as root) — no token needed, enrollment is open:
-#   curl -fsSL https://raw.githubusercontent.com/0x9Angel/gotham-relay/main/infra/scripts/install-relay.sh | sudo bash
+# USAGE (run as root) — no token needed, enrollment is open, but you MUST name
+# yourself so the network is allowed to route through you (see GOTHAM_OPERATOR):
+#   curl -fsSL https://raw.githubusercontent.com/0x9Angel/gotham-relay/main/infra/scripts/install-relay.sh | sudo GOTHAM_OPERATOR=your-name bash
 #
 # or, after cloning the repo:
-#   sudo bash infra/scripts/install-relay.sh
+#   sudo GOTHAM_OPERATOR=your-name bash infra/scripts/install-relay.sh
 #
-# CONFIG (environment variables — ALL OPTIONAL):
+# CONFIG (environment variables):
+#   GOTHAM_OPERATOR       REQUIRED. Public nickname identifying who runs this
+#                         relay. Path selection refuses two hops it cannot PROVE
+#                         belong to different operators, so an unlabelled relay
+#                         is never routed. Use the SAME value on every relay you
+#                         run, so diversity reflects who actually runs what.
 #   GOTHAM_ENROLL_TOKEN   Only if the authority runs in closed/token mode.
 #                         Enrollment is OPEN by default — you do NOT need one.
 #   GOTHAM_AUTHORITY_URL  Directory authority base URL.
 #                         Default: http://144.24.205.188:8443
+#   GOTHAM_EXTRA_AUTHORITY_URLS
+#                         Space-separated ADDITIONAL authorities to enroll with.
+#                         Clients need a quorum of attestations, so the default
+#                         is the other two authorities of the shipped set.
 #   GOTHAM_TIER           entry | mix | exit. Default: mix
 #                         (a middle hop sees neither sender nor recipient —
 #                          the safest role for a volunteer).
@@ -29,10 +39,6 @@
 #                         (RFC B3) when no reachable public address is found —
 #                         this is what lets a 4G/5G / CGNAT box be a relay.
 #   GOTHAM_COUNTRY        ISO 3166-1 code to publish (e.g. FR). Optional.
-#   GOTHAM_OPERATOR       REQUIRED. Public nickname identifying who runs this
-#                         relay. Path selection refuses two hops it cannot prove
-#                         belong to different operators, so an unlabelled relay
-#                         is never selected. Use the SAME value on all yours.
 #
 # What it does:
 #   1. Installs minimal deps (curl, ufw, ca-certificates)
@@ -41,7 +47,8 @@
 #   4. Generates an X25519 identity key if one doesn't exist
 #   5. Writes the relay config + installs a hardened systemd unit
 #   6. Opens the firewall (SSH + your UDP port), starts the service
-#   7. Waits and reports whether the authority accepted the enrollment
+#   7. Waits until enough authorities have attested the relay, and says so
+#      honestly when they have not
 
 set -euo pipefail
 
@@ -56,27 +63,13 @@ TIER="${GOTHAM_TIER:-mix}"
 PORT="${GOTHAM_PORT:-443}"
 COUNTRY="${GOTHAM_COUNTRY:-}"
 # Path selection refuses two hops it cannot PROVE belong to different
-# operators, so a relay with no label can never be part of a route. Defaults to
-# the hostname, which is at least stable and distinct per machine; operators
-# running several relays should set GOTHAM_OPERATOR to the same value on all of
-# them so diversity actually reflects who runs what.
+# operators, so a relay with no label can never be part of a route. This used to
+# fall back to the hostname, which is worse than it looks: two relays run by the
+# same person get two different hostnames, so the network would treat them as
+# independent operators and could put both at the two ends of one path -- the
+# exact correlation the rule exists to prevent. Only the operator knows the
+# right value, so we ask for it and refuse to guess.
 OPERATOR="${GOTHAM_OPERATOR:-}"
-if [[ -z "$OPERATOR" ]]; then
-    echo "[!] GOTHAM_OPERATOR is required and was not set."
-    echo
-    echo "    It is a public nickname saying who runs this relay. Path selection"
-    echo "    fails closed on operator diversity: two relays that cannot be PROVEN"
-    echo "    to belong to different operators never share a path."
-    echo
-    echo "    This used to default to the hostname, which was worse than useless:"
-    echo "    two machines run by the same person got two different labels and"
-    echo "    counted as two independent operators, which is precisely the"
-    echo "    property the rule exists to enforce. Use the SAME value on every"
-    echo "    relay you run, and one nobody else is using."
-    echo
-    echo "    Example:  GOTHAM_OPERATOR=alice GOTHAM_TIER=exit sudo -E $0"
-    exit 1
-fi
 ENROLL_TOKEN="${GOTHAM_ENROLL_TOKEN:-}"
 
 REPO="0x9Angel/gotham-relay"
@@ -96,6 +89,31 @@ RELAY_USER=gotham
 # ─── Sanity checks ──────────────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "Run as root: sudo bash $0"; exit 1; }
 case "$TIER" in entry|mix|exit) ;; *) echo "[!] GOTHAM_TIER must be entry|mix|exit (got '$TIER')"; exit 1;; esac
+# Checked BEFORE anything is installed: a relay that cannot be routed is worse
+# than no relay, because nobody finds out. Better a clean refusal now.
+if [[ -z "$OPERATOR" ]]; then
+    echo "[!] GOTHAM_OPERATOR is required and was not set."
+    echo
+    echo "    Clients refuse to build a path through two relays unless they can"
+    echo "    prove the relays belong to DIFFERENT operators, and a relay with no"
+    echo "    operator label counts as unproven. An unlabelled relay would run,"
+    echo "    report itself healthy, and never carry a single packet."
+    echo
+    echo "    Re-run with a public nickname, e.g.:"
+    echo "      sudo GOTHAM_OPERATOR=your-name bash $0"
+    echo
+    echo "    Use the SAME value on every relay you run, so the network can tell"
+    echo "    your machines apart from everyone else's."
+    exit 1
+fi
+# The label reaches the relay through systemd's word-splitting of
+# GOTHAM_EXTRA_ARGS, so a space or a quote in it would silently become a
+# separate argument and shift every flag after it.
+[[ "$OPERATOR" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || {
+    echo "[!] GOTHAM_OPERATOR must be 1 to 32 characters from A-Z a-z 0-9 . _ -"
+    echo "    (got '$OPERATOR')"
+    exit 1
+}
 echo "[1/7] Installing dependencies..."
 if command -v apt-get &>/dev/null; then
     export DEBIAN_FRONTEND=noninteractive
@@ -137,12 +155,8 @@ ADVERTISE_IP="${GOTHAM_ADVERTISE_IP:-$(curl -fsSL --max-time 8 https://api.ipify
 
 EXTRA=""
 [[ -n "$COUNTRY"  ]] && EXTRA+=" --country $COUNTRY"
-if [[ -z "$OPERATOR" ]]; then
-  echo "[!] No operator label could be determined and none was given."
-  echo "    A relay without one is never selected for a path. Set GOTHAM_OPERATOR."
-  exit 1
-fi
 EXTRA+=" --operator $OPERATOR"
+# One enrollment per authority; each one's PoP key is auto-fetched from its /pop.
 for u in $EXTRA_AUTHORITY_URLS; do
   EXTRA+=" --extra-authority-url $u"
 done
@@ -354,6 +368,7 @@ else
     echo " Reachable  : via rendezvous ${R_ADDR:-?}   (tier: $TIER, CGNAT/B3)"
 fi
 echo " Authority  : $AUTHORITY_URL"
+echo " Also enrolled with: $EXTRA_AUTHORITY_URLS"
 echo " Operator   : $OPERATOR   (a relay without a label is never routed)"
 echo "------------------------------------------------------------"
 echo " Check this relay at any time — it answers in plain language:"
