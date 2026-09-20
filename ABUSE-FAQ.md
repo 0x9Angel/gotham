@@ -102,8 +102,10 @@ maintained gives users false confidence. If this changes it will be announced.
 If you believe Gotham is being used to harm someone, we want to know, and we
 will be honest about what we can do. The design means we cannot read messages or
 identify users. We can act on the parts we do control: the software, the
-directory, and relay admission. Open an issue or contact the address in
-`SECURITY.md`.
+directory, and relay admission. Open an issue, or mail
+**crypto.app.organisation@proton.me** (the address in the root
+[README](README.md); the disclosure policy itself is not published in this
+mirror).
 
 We would rather say "here is precisely what we can and cannot do" than promise a
 moderation capability that the architecture does not permit.

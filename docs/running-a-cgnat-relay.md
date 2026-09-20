@@ -60,8 +60,11 @@ and your relay appears in `GET http://144.24.205.188:8443/directory` with a
 - **A CGNAT relay inherits its rendezvous point's `/16` / operator** for
   diversity accounting (anti-Sybil: all your traffic funnels through `R`, so you
   cannot be counted as more diverse than `R`). So CGNAT relays **add capacity and
-  participation**, but they do **not** add an independent `/16` — the diverse
-  3-hop backbone still needs public relays on distinct `/16`.
+  participation**, but they do **not** add an independent `/16` *or an
+  independent operator label* — the diverse 3-hop backbone still needs public
+  relays on distinct `/16`s under distinct operator labels. The operator label is
+  the binding one today: path selection fails closed, so two relays whose
+  operators cannot be *proven* different are never put on the same path.
 - **The rendezvous point sees your traffic timing/volume** (like a Tor bridge
   sees its clients). A CGNAT relay is therefore **anonymity-weaker** than a
   direct public relay. Good for scale; keep the backbone on direct relays.

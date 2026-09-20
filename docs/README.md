@@ -22,10 +22,12 @@ A Sphinx/Loopix mixnet:
   in principle be attacked by a future quantum adversary at the transport layer,
   even where the message content has the hybrid layer.
 - **Loopix-style mixing** — per-hop exponential delays plus Poisson cover traffic
-  to resist timing correlation. Budget for **seconds, not milliseconds**: the
-  default cover mode draws a 500 ms mean delay per hop, so a 3-hop path averages
-  about 1.5 s one way and its tail runs to several seconds. This is deliberate —
-  mixing *is* delay — and it is why voice does not travel over the mixnet.
+  to resist timing correlation. Budget for **seconds, not milliseconds**: every
+  anonymity mode draws the same 500 ms mean delay per hop — they used to differ,
+  which let the first relay sort traffic by the sender's setting — so a 3-hop
+  path averages about 1.5 s one way and its tail runs to several seconds. This
+  is deliberate — mixing *is* delay — and it is why voice does not travel over
+  the mixnet.
 - **Directory authority** — relays self-enrol; the authority proves each is
   live and publishes a signed directory that clients pin, admitted by a
   **2-of-3 quorum** so no single authority key controls the route set.
@@ -93,18 +95,27 @@ reinstall with the same public key.
 
 The root README points here for these, so here they are rather than nowhere.
 
-- **One critical finding is open.** The per-hop MAC (γ) authenticates only its
-  own slot of the routing block, so **two colluding relays can tag a packet on
-  the way in and recognise it on the way out**, linking sender to recipient
-  deterministically from a single packet. Unexploitable while every relay has the
-  same operator — the case today — and it must be closed before third-party
-  relays carry real traffic. Closing it requires a wire-format change
-  (VERSION 3).
+- **The finding rated critical is reduced, not closed.** The per-hop MAC (γ)
+  used to authenticate only its own slot of the routing block, so **two
+  colluding relays could tag a packet on the way in and recognise it on the way
+  out**, linking sender to recipient deterministically from a single packet. The
+  wire-format change landed: in VERSION 3 each γ covers its own slot *and* every
+  slot after it, so the first honest hop after a tagger drops the packet, which
+  closes the entry↔exit case. It is reduced rather than closed for two reasons.
+  Relays still accept v2 headers by default, so the old channel stays open for v2
+  traffic until the clients they serve have moved and the fleet runs with
+  `--strict-header-v3`. And two *adjacent* colluding relays can still tag, since
+  the tagger's immediate successor is the reader and ignores its own MAC failure
+  — on a 3-hop path that is entry+middle or middle+exit, neither of which links
+  sender to recipient. Unexploitable while every relay has the same operator, the
+  case today.
 - **`hop_index` and `hop_count` travel in clear** (F-54, reduced not closed).
   One byte tells a relay its position in the path, which means the first relay
   learns its peer is the *original sender* rather than another relay. Sealed
   sender hides *who* is sending; these bytes reveal *that* the peer is the
-  sender. Same VERSION 3 change.
+  sender. VERSION 3 did not change this: it widened MAC coverage, it did not
+  mask these two bytes, which `encode` still writes in the plain meta region.
+  Removing them needs a further wire-format change.
 - **Per-hop key agreement is classical**, not post-quantum. See "What it is".
 - **The mixnet does not carry voice, and will not.** Calls are TURN-relayed
   WebRTC: the relay operator sees both IP addresses, the time and the duration.

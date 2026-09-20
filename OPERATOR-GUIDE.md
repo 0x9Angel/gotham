@@ -41,9 +41,10 @@ it: path selection refuses to build a path through two relays it cannot prove
 belong to different operators.
 
 **What the table above does not describe is the network as it stands today.**
-Building a path needs at least three relays, all three tiers populated, and two
-distinct *attested* operators. The current fleet does not meet that, so the
-client falls back to depositing into, and collecting from, a mailbox host over
+Building a path needs at least three relays, all three tiers populated, and
+three distinct *attested* operators — the rule rejects *any* two hops on a path
+that share one, not just the two ends. The current fleet does not meet that, so
+the client falls back to depositing into, and collecting from, a mailbox host over
 a **direct** connection. In that mode one relay — the mailbox host — sees the
 sender's IP and the recipient's IP filed against the same mailbox identifier.
 The client logs this fallback loudly, and the code calls it the largest
@@ -146,14 +147,22 @@ operator, and the network needs three.** That is not a reason to stay away — i
 is the reason the project needs you — but you should know that anonymity does
 not switch on the day you join. It switches on the day the third operator joins.
 
-**There is also one open finding you should hear about before deciding.** The
-per-hop MAC authenticates only part of the routing block, so two *colluding*
-relays can tag a packet on the way in and recognise it on the way out. Today
-that is unexploitable — every relay is ours, and a collusion of one party with
-itself reveals nothing new. It stops being harmless the moment the fleet is
-genuinely mixed, which is precisely what you would be helping bring about. It is
-rated critical, it needs a wire-format change, and closing it before third-party
-relays carry real traffic is the project's own commitment to you.
+**There is also one finding you should hear about before deciding.** The
+per-hop MAC used to authenticate only part of the routing block, so two
+*colluding* relays could tag a packet on the way in and recognise it on the way
+out. The wire-format change that closes that exists: version 3 of the header
+extends each MAC to cover its own slot and every slot after it, so the first
+honest hop after a tagger drops the packet. It is rated critical and counted as
+reduced rather than closed, because relays still accept v2 headers by default —
+the old channel stays open for that traffic until the clients they serve have
+moved and the fleet is restarted with `--strict-header-v3`. A narrower residual
+survives even then: two *adjacent* colluding relays can still tag, which on a
+3-hop path is entry+middle or middle+exit, neither of which links sender to
+recipient. Today none of it is exploitable — every relay is ours, and a
+collusion of one party with itself reveals nothing new. It stops being harmless
+the moment the fleet is genuinely mixed, which is precisely what you would be
+helping bring about, and finishing that deployment before third-party relays
+carry real traffic is the project's own commitment to you.
 
 ## What we ask of you
 

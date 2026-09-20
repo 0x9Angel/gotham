@@ -18,37 +18,55 @@ Read this before anything else.
   anonymity set — the number of independent relays and the volume of unrelated
   traffic your messages hide in. A small deployment protects less than a large
   one. This is a property of the deployment, not a checkbox in the code.
-- It has **not been audited by an independent third party**. Two internal
-  campaigns have been run. July 2026: 72 findings examined, 30 refuted by
-  counter-analysis, 42 confirmed, 30 fixed with a regression test each. August
-  2026, after deduplication against the first: 71 findings, of which **46 are
-  fixed and tested**, 6 reduced with the residual written down, and **19 still
-  open** — including the one rated critical below. The real open count is
-  higher and is honestly unknown: twelve findings left open by the July
-  campaign were never folded back into the register, and since the register
-  already deduplicated the two campaigns, nobody can say how many of those
-  twelve are already counted. Somewhere between 19 and 31. Internal is not independent,
-  and a count of findings fixed says nothing about the ones nobody has looked
-  for yet.
-- **One critical finding is open.** The per-hop MAC authenticates only one slot
-  of the routing block, so two colluding relays can tag a packet on the way in
-  and recognise it on the way out. It is not exploitable while every relay is
-  run by the same operator — which is the case today — and it must be closed by
-  a wire-format change before third-party relays are admitted. If you are
-  considering running a relay, this is the finding to ask about.
+- It has **not been audited by an independent third party**. The register comes
+  from two internal campaigns of early August 2026 — an offensive audit on the
+  3rd, a manual code review on the 4th — after deduplication and removal of what
+  was already fixed. Every suspected flaw first faced a second analysis whose job
+  was to refute it; what did not survive that step is not counted. **71 findings
+  recorded**: as of 15 September 2026, **56 are fixed** — with a regression test
+  each wherever the attack can be replayed by a program — **13 are reduced**,
+  with the surviving risk written down in the register rather than glossed over,
+  and **2 are still open**. The findings left open by the general review of July
+  2026 have not been folded into this register, so read the open count as a
+  floor. Internal is not independent, and a count of findings fixed says nothing
+  about the ones nobody has looked for yet.
+- **The finding rated critical is reduced, not closed.** The per-hop MAC used to
+  authenticate only one slot of the routing block, so two colluding relays could
+  tag a packet on the way in and recognise it on the way out. Header **version 3**
+  closes that channel: each hop's MAC now covers the rest of the routing block
+  after it, so a relay that tags a slot further down the path is caught by the
+  first honest hop that follows. Shipped on 13 September 2026, in relay
+  **v0.12.0** and application **2.3.0**. Two residuals stay on the record rather
+  than being called done: relays still accept the old header until
+  `--strict-header-v3` is set across the whole fleet, and two colluding relays
+  that sit **immediately next to each other** keep a tagging channel this
+  construction cannot close by design.
+- **The two findings still open are one defect seen from two sides.** A relay's
+  operator label is a string the relay declares about itself, and the authority
+  signs it as it stands — while every path-diversity rule rests on that label.
+  Nothing checks that two labels belong to two different people, so an adversary
+  willing to enrol relays under several labels defeats the diversity rule without
+  forging anything. What counts as proof that an operator is one has not been
+  settled. If you are considering running a relay, this is the finding to ask
+  about.
 - Some known limitations are structural and written down in
   [`docs/README.md`](docs/README.md) rather than quietly omitted. One that used
   to be listed here is no longer true and is corrected rather than quietly
   dropped: β is **not** byte-identical between hops — it is re-randomised at
-  every hop, and a regression test covers every pair of hops. The open defect
-  is narrower and different: the per-hop MAC authenticates only one slot of the
-  routing block, which is the critical finding above.
+  every hop, and a regression test covers every pair of hops. The defect that
+  was real there is narrower and different, and it is the reduced critical
+  finding above.
 - **All three directory authorities are run by one person**, the author. The
   2-of-3 quorum stops a single key from forging the relay list; it does not stop
-  a simultaneous seizure of all three hosts. Recruiting independent authority
-  operators is the network's declared first priority, and the reason it does not
-  yet route: path selection refuses two relays it cannot prove belong to
-  different operators, and there is only one.
+  a simultaneous seizure of all three hosts.
+- **The network does not route today, and the reason is people, not machines.**
+  Path selection refuses two hops on the same path unless it can prove they
+  belong to different operators — at every hop, not only at the two ends — so a
+  three-hop route needs three independent operators. Every relay in the fleet
+  carries the same operator label, so no route can be built at all and traffic
+  falls back to the mailbox. More machines, or more address ranges, under that
+  one label change nothing. Recruiting independent operators is the network's
+  declared first priority.
 
 If you are evaluating this for anything where being wrong has consequences,
 start with the limitations, not the features.
@@ -70,16 +88,24 @@ start with the limitations, not the features.
   block, so the payload is non-malleable.
 - **Loopix delays** drawn per hop by the sender, plus Poisson cover traffic, so a
   real send is not distinguishable by timing from a decoy.
-- **Sealed sender** — the entry relay does not learn who is sending.
-- **Enforced path diversity** — entry and exit may not share an operator, an
-  IPv4 /16, or an IPv6 /48.
+- **Sealed sender** — the entry relay does not learn who is sending. It hides
+  *who* is sending, not *that* the peer is the sender: `hop_index` and
+  `hop_count` travel in the clear, so the first relay knows its peer is the
+  original sender and every relay knows the length of the path it is on.
+- **Enforced path diversity** — no two hops anywhere on the path may share an
+  operator label, an IPv4 /16 or an IPv6 /48; entry and exit in particular. The
+  rule fails closed: a relay whose operator cannot be shown to differ counts as
+  the same operator, not as a different one.
 - **Store-and-forward mailboxes** addressed by a derived id, with a DH-MAC
   possession proof: holding a recipient's *public* key is not enough to read or
   delete their mail. The id is **not unlinkable**, and it would be wrong to
   imply otherwise: it is a hash of the recipient's public key, and that key
   travels in every invitation and every contact card. Anyone holding someone's
   contact card can compute their mailbox id — and, from a seized relay, show
-  that this person received mail there and when.
+  that this person received mail there and when. The proof also binds third
+  parties rather than the host: whoever runs the relay cannot read the envelopes,
+  but can lose or destroy them, which surfaces as a non-delivery rather than as
+  a leak.
 - **SURBs** — single-use reply blocks, so a recipient can collect mail without
   revealing their IP to the host. Implemented, but **not reachable on the
   current fleet**: the anonymous fetch needs a routable path, and with too few
@@ -123,6 +149,11 @@ installers in [`infra/scripts/`](infra/scripts/).
 unlabelled relay is never selected by path selection, so it would burn your
 bandwidth while looking perfectly healthy.
 
+Enrolment with the authorities this project runs is closed: the relay has to
+present a bearer token (`GOTHAM_ENROLL_TOKEN`, or `--enroll-token`). An
+authority started with no token list accepts any enrolment — that is a
+deployment choice, not a property of the code.
+
 A relay behind CGNAT needs **no port forwarding**: it keeps an outbound tunnel to
 a public rendezvous relay and is reachable through it.
 
@@ -134,6 +165,9 @@ you choose.
 
 Mail **crypto.app.organisation@proton.me**. Reports are handled as a priority and
 there will be no legal action against anyone acting in good faith.
+
+No PGP key is published to date, so treat the mail as you would any other
+plaintext mail to a provider-hosted address.
 
 Please give us a reasonable window to ship a fix before publishing.
 
