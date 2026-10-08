@@ -48,6 +48,85 @@ pub fn mailbox_id_for(recipient_pubkey: &[u8]) -> MailboxId {
     *h.finalize().as_bytes()
 }
 
+/// The permanent, pre-rotation address: an alias of [`mailbox_id_for`], named
+/// for what it is now that per-epoch addresses exist.
+#[must_use]
+pub fn mailbox_id_legacy(recipient_pubkey: &[u8]) -> MailboxId {
+    mailbox_id_for(recipient_pubkey)
+}
+
+/// The per-epoch mailbox address (F-07).
+///
+/// Clients from Crypto 2.4.0 on deposit to and read from this address instead
+/// of the permanent one, so a mailbox host stops seeing one identifier come
+/// back for the life of a key. The epoch comes from the SIGNED directory's
+/// `valid_after` ([`mailbox_epoch_of`]), never from a local clock. The
+/// derivation is a wire contract with those clients: it must stay byte for
+/// byte `blake3(domain || recipient_pk || epoch_be)`.
+#[must_use]
+pub fn mailbox_id_for_epoch(recipient_pubkey: &[u8], epoch: u64) -> MailboxId {
+    let mut h = blake3::Hasher::new();
+    h.update(MAILBOX_ID_DOMAIN);
+    h.update(recipient_pubkey);
+    h.update(&epoch.to_be_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// The address a sender deposits to, given the directory it holds.
+#[must_use]
+pub fn mailbox_id_for_deposit(recipient_pubkey: &[u8], valid_after: u64) -> MailboxId {
+    mailbox_id_for_epoch(recipient_pubkey, mailbox_epoch_of(valid_after))
+}
+
+/// The per-epoch addresses a recipient reads: this epoch and the last (peers
+/// do not refresh the directory at the same instant). Clients also drain the
+/// legacy address.
+#[must_use]
+pub fn mailbox_ids_to_read(recipient_pubkey: &[u8], valid_after: u64) -> [MailboxId; 2] {
+    let e = mailbox_epoch_of(valid_after);
+    [
+        mailbox_id_for_epoch(recipient_pubkey, e),
+        mailbox_id_for_epoch(recipient_pubkey, e.saturating_sub(1)),
+    ]
+}
+
+/// How many epochs BEFORE its own a relay still serves a fetch for.
+///
+/// Sized from what the relay may still be holding: an entry lives up to the
+/// TTL ceiling ([`DEFAULT_MAX_TTL_SECS`]) under an address up to one epoch
+/// older than the relay's at deposit time (a sender whose directory predates
+/// midnight). Every such entry must stay fetchable by its owner. It also covers
+/// what today's clients ask for — the current and previous epoch of a directory
+/// at most a few hours old.
+pub const FETCH_EPOCHS_BEHIND: u64 = DEFAULT_MAX_TTL_SECS / MAILBOX_EPOCH_SECS + 2;
+
+/// How many epochs AFTER its own a relay still serves a fetch for: one, for a
+/// relay clock running behind the authority's across the daily boundary.
+pub const FETCH_EPOCHS_AHEAD: u64 = 1;
+
+/// Does `pk` own `id` at relay time `now` (unix seconds)?
+///
+/// NET-01. Crypto 2.4.0 moved deposits and reads to [`mailbox_id_for_epoch`],
+/// but this check — the relay's whole idea of ownership — compared against the
+/// permanent address alone. Every per-epoch deposit was acknowledged and every
+/// fetch of it refused as `Unauthorized`: mail between two 2.4.x clients,
+/// invitations included, sat on the relay until it expired.
+///
+/// Ownership is now the legacy address, or the per-epoch address for any epoch
+/// in `[cur - FETCH_EPOCHS_BEHIND, cur + FETCH_EPOCHS_AHEAD]`. The window is not
+/// a security boundary: every candidate derives from `pk`, so a proof still only
+/// ever opens its maker's own mail. It bounds the work (a few dozen hashes, next
+/// to the X25519 the caller already did) and nothing else.
+#[must_use]
+pub fn mailbox_id_owned_at(pk: &[u8], id: &MailboxId, now: u64) -> bool {
+    if mailbox_id_legacy(pk) == *id {
+        return true;
+    }
+    let cur = mailbox_epoch_of(now);
+    (cur.saturating_sub(FETCH_EPOCHS_BEHIND)..=cur.saturating_add(FETCH_EPOCHS_AHEAD))
+        .any(|e| mailbox_id_for_epoch(pk, e) == *id)
+}
+
 /// Domain-separation label for the mailbox **fetch possession proof**.
 const MAILBOX_FETCH_AUTH_DOMAIN: &str = "gotham-mailbox-fetch-v1";
 
@@ -108,14 +187,29 @@ pub fn fetch_auth_tag(shared: &[u8; 32], binding: &[u8], id: &MailboxId) -> [u8;
 }
 
 impl FetchAuth {
-    /// Verify this proof against the relay's side of the DH.
+    /// Verify this proof against the relay's side of the DH, at the relay's
+    /// current time.
     ///
     /// Checks BOTH that `pk` actually owns `id` (so a valid proof for one's own
     /// mailbox cannot be replayed against someone else's) and that the tag
-    /// matches, in constant time.
+    /// matches, in constant time. It reads the clock because the relay's call
+    /// sites pass none; [`FetchAuth::verify_at`] is the pure form.
     #[must_use]
     pub fn verify(&self, shared: &[u8; 32], binding: &[u8], id: &MailboxId) -> bool {
-        if mailbox_id_for(&self.pk) != *id {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            // A clock before 1970 lands on epoch 0: the legacy address still
+            // passes, which is what a relay did before epochs existed.
+            .map_or(0, |d| d.as_secs());
+        self.verify_at(shared, binding, id, now)
+    }
+
+    /// [`FetchAuth::verify`] with the relay's clock supplied by the caller
+    /// (`now`, unix seconds): `pk` must own `id` at `now`
+    /// ([`mailbox_id_owned_at`]) and the tag must match, in constant time.
+    #[must_use]
+    pub fn verify_at(&self, shared: &[u8; 32], binding: &[u8], id: &MailboxId, now: u64) -> bool {
+        if !mailbox_id_owned_at(&self.pk, id, now) {
             return false;
         }
         let expected = fetch_auth_tag(shared, binding, id);
@@ -217,6 +311,10 @@ struct Entry {
     expires_at: u64,
 }
 
+/// The default policy's TTL ceiling: 30 days. Named because the relay's fetch
+/// window ([`FETCH_EPOCHS_BEHIND`]) is sized from it.
+pub const DEFAULT_MAX_TTL_SECS: u64 = 30 * 24 * 3600;
+
 /// Resource limits — bound memory and blunt flooding / DoS.
 #[derive(Clone, Debug)]
 pub struct MailboxPolicy {
@@ -271,7 +369,7 @@ impl Default for MailboxPolicy {
             // global budget instead of 8.
             max_total_bytes: 512 * 1024 * 1024,
             default_ttl_secs: 7 * 24 * 3600, // 7 days
-            max_ttl_secs: 30 * 24 * 3600,    // 30 days
+            max_ttl_secs: DEFAULT_MAX_TTL_SECS,
         }
     }
 }
@@ -1113,5 +1211,164 @@ mod tests {
         // the whole requirement: they must meet at a host without talking.
         let valid_after = 1_757_000_000u64;
         assert_eq!(mailbox_epoch_of(valid_after), mailbox_epoch_of(valid_after));
+    }
+}
+
+/// NET-01 — the relay must serve the addresses Crypto 2.4.x clients use.
+#[cfg(test)]
+mod relay_epoch_window_tests {
+    use super::*;
+
+    const DAY: u64 = MAILBOX_EPOCH_SECS;
+    const HOUR: u64 = 3600;
+    // Mid-epoch, so offsets of a few hours stay inside it unless a test
+    // deliberately crosses the boundary.
+    const NOW: u64 = 20_000 * DAY + 12 * HOUR;
+
+    fn proof_for(pk: [u8; 32], id: &MailboxId) -> (FetchAuth, [u8; 32], &'static [u8]) {
+        let shared = [0x5Au8; 32];
+        let binding: &[u8] = b"noise handshake hash";
+        let auth = FetchAuth {
+            pk,
+            tag: fetch_auth_tag(&shared, binding, id),
+        };
+        (auth, shared, binding)
+    }
+
+    /// The derivation is a wire contract with the 2.4.x clients: pinned here so
+    /// a refactor cannot drift from it silently.
+    #[test]
+    fn the_epoch_address_is_domain_key_then_big_endian_epoch() {
+        let pk = [0x11u8; 32];
+        let mut h = blake3::Hasher::new();
+        h.update(b"gotham-mailbox-id-v1");
+        h.update(&pk);
+        h.update(&7u64.to_be_bytes());
+        assert_eq!(mailbox_id_for_epoch(&pk, 7), *h.finalize().as_bytes());
+        assert_ne!(mailbox_id_for_epoch(&pk, 7), mailbox_id_legacy(&pk));
+    }
+
+    /// The regression itself: a well-formed proof for the address a 2.4.x
+    /// client reads must be accepted. Before the fix this was `false` for every
+    /// epoch address, whatever the clock said.
+    #[test]
+    fn a_proof_for_the_epoch_address_a_client_reads_is_accepted() {
+        let pk = [7u8; 32];
+        for id in mailbox_ids_to_read(&pk, NOW) {
+            let (auth, shared, binding) = proof_for(pk, &id);
+            assert!(auth.verify_at(&shared, binding, &id, NOW));
+        }
+        let deposit = mailbox_id_for_deposit(&pk, NOW);
+        let (auth, shared, binding) = proof_for(pk, &deposit);
+        assert!(auth.verify_at(&shared, binding, &deposit, NOW));
+    }
+
+    /// The wrapper reads the real clock; a proof for today's address passes it.
+    #[test]
+    fn verify_with_the_real_clock_accepts_todays_address() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let pk = [8u8; 32];
+        let id = mailbox_id_for_deposit(&pk, now);
+        let (auth, shared, binding) = proof_for(pk, &id);
+        assert!(auth.verify(&shared, binding, &id));
+    }
+
+    /// Older peers deposit to the permanent address, and clients still drain
+    /// it. It stays accepted whatever the epoch.
+    #[test]
+    fn the_legacy_address_is_still_served() {
+        let pk = [9u8; 32];
+        let id = mailbox_id_legacy(&pk);
+        let (auth, shared, binding) = proof_for(pk, &id);
+        assert!(auth.verify_at(&shared, binding, &id, NOW));
+        assert!(auth.verify_at(&shared, binding, &id, 0));
+    }
+
+    /// Every directory a correct client can be routing on (signed up to 1 h ago
+    /// plus a 2 h staleness tolerance), on either side of midnight.
+    #[test]
+    fn every_directory_a_client_may_hold_is_covered() {
+        let pk = [3u8; 32];
+        for relay_now in [
+            NOW,
+            20_001 * DAY,
+            20_001 * DAY + 5 * 60,
+            20_001 * DAY + 2 * HOUR,
+        ] {
+            for age in [0, 30 * 60, HOUR, 2 * HOUR, 3 * HOUR] {
+                let valid_after = relay_now - age;
+                for id in mailbox_ids_to_read(&pk, valid_after) {
+                    assert!(
+                        mailbox_id_owned_at(&pk, &id, relay_now),
+                        "relay at {relay_now} refused a read for a document {age}s old",
+                    );
+                }
+            }
+        }
+    }
+
+    /// A relay whose clock is behind the authority's, across midnight.
+    #[test]
+    fn a_relay_clock_behind_the_authority_still_serves() {
+        let pk = [4u8; 32];
+        let authority_signed = 20_001 * DAY + 60;
+        let relay_now = 20_001 * DAY - 10 * 60;
+        for id in mailbox_ids_to_read(&pk, authority_signed) {
+            assert!(mailbox_id_owned_at(&pk, &id, relay_now));
+        }
+    }
+
+    /// Ownership is still ownership: another key's epoch address is refused.
+    #[test]
+    fn another_keys_epoch_address_is_refused() {
+        let victim = [1u8; 32];
+        let attacker = [2u8; 32];
+        let victims = mailbox_id_for_deposit(&victim, NOW);
+        assert!(!mailbox_id_owned_at(&attacker, &victims, NOW));
+        let (auth, shared, binding) = proof_for(attacker, &victims);
+        assert!(!auth.verify_at(&shared, binding, &victims, NOW));
+    }
+
+    /// The window is bounded on both sides.
+    #[test]
+    fn the_window_is_bounded() {
+        let pk = [5u8; 32];
+        let cur = mailbox_epoch_of(NOW);
+        for e in cur - FETCH_EPOCHS_BEHIND..=cur + FETCH_EPOCHS_AHEAD {
+            assert!(mailbox_id_owned_at(&pk, &mailbox_id_for_epoch(&pk, e), NOW));
+        }
+        let too_old = mailbox_id_for_epoch(&pk, cur - FETCH_EPOCHS_BEHIND - 1);
+        let too_new = mailbox_id_for_epoch(&pk, cur + FETCH_EPOCHS_AHEAD + 1);
+        assert!(!mailbox_id_owned_at(&pk, &too_old, NOW));
+        assert!(!mailbox_id_owned_at(&pk, &too_new, NOW));
+    }
+
+    /// Everything the relay can still hold stays fetchable by its owner.
+    #[test]
+    fn mail_alive_on_the_relay_stays_fetchable_by_its_owner() {
+        let pk = [7u8; 32];
+        let deposited_at = NOW;
+        let id = mailbox_id_for_deposit(&pk, deposited_at - DAY);
+        for now in [
+            deposited_at,
+            deposited_at + 7 * DAY,
+            deposited_at + DEFAULT_MAX_TTL_SECS,
+        ] {
+            assert!(mailbox_id_owned_at(&pk, &id, now));
+        }
+    }
+
+    /// A tag bound to a different address does not pass, even for an address
+    /// the key owns: the id is inside the MAC, not only in the ownership check.
+    #[test]
+    fn a_tag_for_one_owned_address_does_not_open_another() {
+        let pk = [6u8; 32];
+        let [current, previous] = mailbox_ids_to_read(&pk, NOW);
+        let (auth, shared, binding) = proof_for(pk, &current);
+        assert!(auth.verify_at(&shared, binding, &current, NOW));
+        assert!(!auth.verify_at(&shared, binding, &previous, NOW));
     }
 }
