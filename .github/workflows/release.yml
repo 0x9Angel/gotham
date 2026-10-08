@@ -65,9 +65,9 @@ jobs:
         run: |
           BIN="cargo"
           [ "${{ matrix.cross }}" = "true" ] && BIN="cross"
-          $BIN build --release --target ${{ matrix.target }} \
+          $BIN build --release --locked --target ${{ matrix.target }} \
             -p crypto-gotham-relay --bin gotham-relay
-          $BIN build --release --target ${{ matrix.target }} \
+          $BIN build --release --locked --target ${{ matrix.target }} \
             -p crypto-gotham-authority --bin gotham-directory-authority
 
       - name: Package + checksum (Unix)
