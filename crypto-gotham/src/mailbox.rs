@@ -7,14 +7,16 @@
 //!
 //! ## Metadata hygiene
 //! To preserve Gotham's unlinkability the store is addressed by an opaque
-//! 32-byte [`MailboxId`] derived from the recipient's public key
-//! ([`mailbox_id_for`]) — never a plaintext identity — and holds only
+//! 32-byte [`MailboxId`] derived from the recipient's public key and the
+//! current epoch ([`mailbox_id_for_epoch`]; older clients use the permanent
+//! [`mailbox_id_for`]) — never a plaintext identity — and holds only
 //! already-sealed ciphertext. Deposits and retrievals themselves travel through
 //! the mixnet, so the host sees mailbox IDs and blob sizes but not *who*
 //! deposits or reads. (The id is a domain-separated hash of the recipient key,
-//! which the sender already knows; it is not a strong blinding against an
-//! adversary who can enumerate candidate keys — a per-epoch blinded address is
-//! future work, see the module tests and GOTHAM notes.)
+//! which the sender already knows; it is not a blinding against an adversary
+//! who can enumerate candidate keys. Nor does its rotation hide anything from
+//! the HOST: a fetch carries the recipient's public key in its [`FetchAuth`],
+//! so the host can join every epoch's address back to one key.)
 //!
 //! ## Abuse resistance
 //! [`MailboxPolicy`] bounds memory and blunts flooding: a max message size, a
@@ -113,10 +115,11 @@ pub const FETCH_EPOCHS_AHEAD: u64 = 1;
 /// invitations included, sat on the relay until it expired.
 ///
 /// Ownership is now the legacy address, or the per-epoch address for any epoch
-/// in `[cur - FETCH_EPOCHS_BEHIND, cur + FETCH_EPOCHS_AHEAD]`. The window is not
-/// a security boundary: every candidate derives from `pk`, so a proof still only
-/// ever opens its maker's own mail. It bounds the work (a few dozen hashes, next
-/// to the X25519 the caller already did) and nothing else.
+/// in `[cur - FETCH_EPOCHS_BEHIND, cur + FETCH_EPOCHS_AHEAD]`. Every candidate
+/// derives from `pk`, so a proof still only ever opens its maker's own mail. The
+/// window bounds the work (a few dozen hashes, next to the X25519 the caller
+/// already did) — and, on the SURB path, how long a captured fetch can be
+/// replayed ([`surb_fetch_binding`]).
 #[must_use]
 pub fn mailbox_id_owned_at(pk: &[u8], id: &MailboxId, now: u64) -> bool {
     if mailbox_id_legacy(pk) == *id {
@@ -154,8 +157,11 @@ const MAILBOX_FETCH_AUTH_DOMAIN: &str = "gotham-mailbox-fetch-v1";
 /// public value, invertible by anyone holding a candidate key list — but it
 /// does remove the (weak) work factor of enumerating candidates. Accepted:
 /// protecting delivery from a trivial remote-deletion attack outweighs a
-/// pre-image cost that never was a security boundary. A per-epoch blinded
-/// mailbox address would restore it; see the module docs.
+/// pre-image cost that never was a security boundary.
+///
+/// It also means the per-epoch address unlinks nothing for the HOST: every
+/// fetch names the same permanent `pk`. Closing that needs a key blinded per
+/// epoch on this wire, which is a relay and client change together.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchAuth {
     /// The recipient's Gotham X25519 public key (the mailbox owner).
@@ -225,9 +231,17 @@ impl FetchAuth {
 
 /// Build the channel binding for a SURB (mixnet) fetch from the serialized
 /// reply block. There is no Noise handshake on that path, so the reply block
-/// itself is the context: a captured tag is useless against any other SURB, and
-/// replaying the *identical* `(surb, tag)` pair only re-delivers to the SURB's
-/// own — legitimate — destination.
+/// itself is the context: a captured tag is useless against any other SURB.
+///
+/// It does NOT make a SURB fetch single-use. The tag carries no time and the
+/// host keeps no record of the fetches it served, so a relay on the owner's
+/// forward path that captured the request can replay it for as long as the id
+/// stays owned ([`mailbox_id_owned_at`]: up to 33 relay-days for a per-epoch
+/// address, forever for the legacy one). The reply still goes to the owner's
+/// reply block, whose keys the owner consumed on first use, so the replay
+/// destroys mail rather than reading it. Latent while the network does not
+/// route (clients only fetch over SURB with three or more hops); closing it
+/// needs a freshness value under the tag and a seen-tag set at the host.
 #[must_use]
 pub fn surb_fetch_binding(surb_bytes: &[u8]) -> Vec<u8> {
     let mut h = blake3::Hasher::new();
@@ -289,12 +303,12 @@ const MAILBOX_RENDEZVOUS_DOMAIN_V2: &[u8] = b"gotham-mailbox-rendezvous-v2";
 /// Mixing the epoch in makes a ground key win for at most one epoch, and the
 /// attacker cannot pre-compute the next one for a fleet they do not control
 /// the directory of. This is a CLIENT-side rule: the relay never computes a
-/// score — `FetchAuth::verify` only checks `mailbox_id_for(pk) == id` — so
-/// salting it changes nothing on the wire and needs no relay rollout.
+/// score, so salting it changes nothing on the wire and needs no relay rollout.
 ///
-/// `mailbox_id_for` is deliberately NOT salted: that IS the wire contract the
-/// deployed relays verify against, and changing it would need a versioned
-/// request and a coordinated rollout.
+/// The mailbox ADDRESS is not like that: the relay checks it in
+/// [`FetchAuth::verify`], so changing it is a wire change. Crypto 2.4.0 salted
+/// it with the epoch anyway, with no relay that accepted the new address —
+/// [`mailbox_id_owned_at`] is the relay half that was missing (NET-01).
 pub fn mailbox_host_score_at(epoch: u64, recipient_pubkey: &[u8], host_id: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(MAILBOX_RENDEZVOUS_DOMAIN_V2);

@@ -1106,8 +1106,8 @@ pub async fn serve_mailbox_connection(
             }
             Ok(MailboxRequest::Fetch { id, auth }) => {
                 // SEC-MBX-01. `fetch_batch` REMOVES what it returns, and the
-                // mailbox address is `blake3(domain || recipient_pk)` over a
-                // public key. Without a possession proof, anyone ever handed a
+                // mailbox address is `blake3(domain || recipient_pk [|| epoch])`
+                // over a public key. Without a possession proof, anyone ever handed a
                 // user's Gotham public key — every contact, anyone with an
                 // invitation URI — can drain that user's offline messages:
                 // silent, deniable, remote message deletion. Require proof that
