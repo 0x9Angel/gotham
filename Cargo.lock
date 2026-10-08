@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "crypto-gotham-authority"
-version = "0.1.0"
+version = "0.12.1"
 dependencies = [
  "axum",
  "base64",
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "crypto-gotham-relay"
-version = "0.1.0"
+version = "0.12.1"
 dependencies = [
  "clap",
  "crypto-gotham",

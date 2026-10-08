@@ -1,6 +1,6 @@
 [package]
 name = "crypto-gotham-authority"
-version = "0.1.0"
+version = "0.12.1"
 edition = "2021"
 license = "AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial"
 description = "Gotham directory authority — collects relay self-enrollments and serves an authority-signed directory"
