@@ -1,60 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial
 // Copyright (C) 2026 0x9Angel.
-// See LICENSE-AGPL and LICENSE-COMMERCIAL in this crate's root.
-
-//! Sphinx-style header — v0.2 slot-based design.
-//!
-//! ## Design choices
-//!
-//! **X25519-only per-hop key agreement.** The ML-KEM-768 hybrid (see
-//! [`crate::hybrid`]) is reserved for the application-layer end-to-end
-//! session. Per-hop ML-KEM would exceed the 2048 B packet budget.
-//!
-//! **Slot-based routing block.** β is organised as [`MAX_HOPS`] fixed
-//! 64-byte slots; each hop's record sits at offset `hop_index * 64`. We
-//! ship a 1-byte `hop_index` field in the header — it leaks the hop's
-//! position in the chain (bounded by `MAX_HOPS = 5`).
-//!
-//! That leak is not cosmetic (F-54): `hop_index == 0` tells the first relay its
-//! peer is the ORIGINAL SENDER rather than another relay, and `hop_count` tells
-//! every relay the path length. Sealed sender hides *who* is sending; these two
-//! bytes reveal *that* the peer is the sender at all. Removing them requires
-//! VERSION 3 — see the note on [`SphinxHeader::hop_index`].
-//!
-//! **β and the trailer are re-randomised at every hop (v0.2).** Each relay
-//! XORs the whole of β‖trailer with ChaCha20(`k_shuffle`) before forwarding,
-//! and the sender pre-compensates so each hop still finds its own slot. v0.1
-//! forwarded both verbatim, which left 332 of the header's 384 bytes constant
-//! from the first link to the last: two relays anywhere on one path could join
-//! their logs on those bytes and tie the sender's address to the recipient
-//! with certainty, from a single packet, with no timing analysis. That is the
-//! one property a mixnet exists to provide, so it is enforced by
-//! `every_hop_emits_a_binarily_different_header` over every PAIR of hops —
-//! the colluding relays need not be adjacent.
-//!
-//! **Per-slot independent ChaCha20 streams.** Each slot is XOR'd with the
-//! relevant hop's ChaCha20(k_header) keystream. Unlinkability of slots
-//! across hops follows from the per-packet ephemeral k_header — a relay
-//! at hop *i* cannot decrypt any slot other than its own because the
-//! per-hop key derivation is gated by the X25519 + re-blinding chain.
-//!
-//! **MAC chain.** Each γ_i is `Poly1305(k_mac_i, meta || α_i || β || trailer)`.
-//! Hop *i*'s routing record carries `next_gamma = γ_{i+1}`, so after
-//! unwrap the relay knows the value to place in the next header's γ.
-//!
-//! ## Wire format (384 B)
-//!
-//! ```text
-//! offset  size  field
-//!     0     1  version (= 1)
-//!     1     1  mode (0=low-lat, 1=balanced, 2=paranoid)
-//!     2     1  hop_count (n; 1 ≤ n ≤ MAX_HOPS)
-//!     3     1  hop_index (i; 0 ≤ i < hop_count) — increments per hop
-//!     4    32  α — X25519 ephemeral public key for this hop
-//!    36   320  β — 5 × 64 B encrypted routing slots
-//!   356    16  γ — Poly1305 MAC over (meta || α || β || trailer)
-//!   372    12  trailer — random padding (covered by γ)
-//! ```
 
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::ChaCha20;
@@ -70,105 +15,49 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{Error, Result};
 
-// ─── Constants ──────────────────────────────────────────────────────────────
-
-/// Total header length on the wire.
 pub const HEADER_LEN: usize = 384;
 
-/// Length of α (X25519 ephemeral public key).
 pub const ALPHA_LEN: usize = 32;
 
-/// Length of β (routing block).
 pub const BETA_LEN: usize = 320;
 
-/// Length of γ (Poly1305 MAC).
 pub const GAMMA_LEN: usize = 16;
 
-/// Length of the trailing random padding (covered by γ).
 pub const TRAILER_LEN: usize = HEADER_LEN - 4 - ALPHA_LEN - BETA_LEN - GAMMA_LEN;
 const _: () = assert!(TRAILER_LEN == 12);
 
-/// Length of a single routing record / slot.
 pub const RECORD_LEN: usize = 64;
 
-/// Maximum number of hops a packet may traverse.
 pub const MAX_HOPS: usize = BETA_LEN / RECORD_LEN;
 const _: () = assert!(MAX_HOPS == 5);
 
-/// Header version byte.
-/// Wire version of the Sphinx header.
-///
-/// Bumped to 2 when β and the trailer started being re-randomised at every hop.
-/// The change is NOT backward compatible: a v1 relay forwards β verbatim, so a
-/// v2 sender's pre-compensation would desynchronise and every downstream hop
-/// would fail its MAC check. Rejecting on the version byte turns that into one
-/// clear error at the first hop instead of an unexplained BadMac in the middle
-/// of the path. Relays and clients must be rolled out together.
 pub const VERSION: u8 = 3;
 
-/// The previous header version, still verifiable by a relay during a rollout.
-///
-/// F-01 — v2's per-hop MAC covered one slot of β, which is the tagging
-/// channel. A relay may accept v2 for a transition window so clients that
-/// have not updated keep working; every v2 packet it accepts is a packet the
-/// channel is open on, and the relay says so in its logs.
 pub const VERSION_LEGACY: u8 = 2;
 
-/// Anonymity modes (numeric values stable across versions).
 pub mod mode {
-    /// 3-hop, ~50-100 ms added latency.
     pub const LOW_LATENCY: u8 = 0;
-    /// 4-hop, ~150 ms added latency. Default.
     pub const BALANCED: u8 = 1;
-    /// 5-hop, ~300 ms added latency.
     pub const PARANOID: u8 = 2;
 }
 
 const SUBKEY_SALT: &[u8] = b"gotham-hop-v1";
 const SUBKEY_INFO: &[u8] = b"gotham:subkeys";
 
-/// Flag bits in [`RoutingRecord::flag`].
 pub mod flag {
-    /// This hop is the packet's final destination — no further forwarding.
     pub const IS_LAST_HOP: u8 = 0b0000_0001;
-    /// Hand the unwrapped payload to the local delivery handler.
     pub const DELIVER_LOCAL: u8 = 0b0000_0010;
-    /// The next hop is reachable only via a rendezvous (RFC B3): this hop must
-    /// deliver to the relay identified by `next_node_id` over its live
-    /// rendezvous tunnel instead of dialing `next_ipv4:next_port` (which is a
-    /// zero sentinel for such a record). See `docs/gotham/design/rfc-b3-*`.
     pub const VIA_RENDEZVOUS: u8 = 0b0000_0100;
 }
 
-// ─── Routing record ─────────────────────────────────────────────────────────
-
-/// A single hop's routing instructions, 64 B encoded.
-///
-/// ```text
-/// offset  size  field
-///     0     4  next_ipv4
-///     4     2  next_port  (big-endian)
-///     6    32  next_node_id  (relay identity fingerprint)
-///    38    16  next_gamma  (the γ the next hop's header will carry)
-///    54     4  delay_micros  (big-endian)
-///    58     1  flag
-///    59     5  _padding (must be zero)
-/// ```
 #[derive(Clone, Copy, Debug, Zeroize)]
 pub struct RoutingRecord {
-    /// Next hop's IPv4 address octets.
     pub next_ipv4: [u8; 4],
-    /// Next hop's UDP port.
     pub next_port: u16,
-    /// Next hop's relay identity fingerprint (X25519 pubkey in v0.1).
     pub next_node_id: [u8; 32],
-    /// γ to install in the next header (the next hop's MAC).
     pub next_gamma: [u8; GAMMA_LEN],
-    /// Mix delay this hop should sleep before forwarding (microseconds).
     pub delay_micros: u32,
-    /// Bitfield, see [`flag`].
     pub flag: u8,
-    /// MUST be zero; reserved for future use.
     pub _padding: [u8; 5],
 }
 
@@ -187,7 +76,6 @@ impl Default for RoutingRecord {
 }
 
 impl RoutingRecord {
-    /// Pack to wire bytes (64 B).
     pub fn encode(&self) -> [u8; RECORD_LEN] {
         let mut out = [0u8; RECORD_LEN];
         out[0..4].copy_from_slice(&self.next_ipv4);
@@ -200,8 +88,6 @@ impl RoutingRecord {
         out
     }
 
-    /// Parse wire bytes back to a record. Total-function; semantic
-    /// validation (e.g. zero `_padding`) is the caller's responsibility.
     pub fn decode(bytes: &[u8; RECORD_LEN]) -> Self {
         let mut next_ipv4 = [0u8; 4];
         next_ipv4.copy_from_slice(&bytes[0..4]);
@@ -225,69 +111,30 @@ impl RoutingRecord {
         }
     }
 
-    /// True iff this hop is the packet's final destination.
     #[must_use]
     pub fn is_last_hop(&self) -> bool {
         self.flag & flag::IS_LAST_HOP != 0
     }
 
-    /// True iff the next hop must be reached over a rendezvous tunnel (RFC B3)
-    /// keyed by [`RoutingRecord::next_node_id`] rather than by dialing
-    /// `next_ipv4:next_port` (which is a zero sentinel for such a record).
     #[must_use]
     pub fn is_via_rendezvous(&self) -> bool {
         self.flag & flag::VIA_RENDEZVOUS != 0
     }
 }
 
-// ─── Header ─────────────────────────────────────────────────────────────────
-
-/// v0.1 slot-based Sphinx header. See module docs for the wire layout.
 #[derive(Clone, Debug)]
 pub struct Header {
-    /// Always equals [`VERSION`].
     pub version: u8,
-    /// Anonymity mode (see [`mode`]).
     pub mode: u8,
-    /// Total hop count `n` (`1 ≤ n ≤ MAX_HOPS`).
-    ///
-    /// **LEAKED IN CLEAR.** Combined with `hop_index` it tells a relay the whole
-    /// shape of the path it is on, and lets an exit recognise itself as the exit
-    /// before doing any work. See `hop_index`.
     pub hop_count: u8,
-    /// Position of THIS hop in the chain (`0 ≤ hop_index < hop_count`).
-    ///
-    /// **LEAKED IN CLEAR — byte 3 of the encoded header (F-54).**
-    ///
-    /// The previous note here said "fixed by `header_v2`". It is not, and was
-    /// not: `encode` writes this byte in the plain meta region and `decode`
-    /// reads it back without any key. A comment asserting a property the code
-    /// does not have is worse than no comment, because it survives review.
-    ///
-    /// Concretely: a relay receiving `hop_index == 0` knows its peer is the
-    /// ORIGINAL SENDER, not another relay. That is the single fact a mixnet
-    /// exists to withhold from the first hop, and sealed sender does not help —
-    /// it hides *who* the sender is, while this reveals *that* the peer is one.
-    ///
-    /// Removing it needs a wire-format change (VERSION 3), where the fix is
-    /// either a shifting β — every hop reads slot 0, so no index has to exist —
-    /// or an index masked under a byte derived from `k_header`, readable only by
-    /// the hop that can do the DH. `hop_count` must go the same way; the
-    /// encrypted `IS_LAST_HOP` flag in the record already carries what the exit
-    /// legitimately needs.
     pub hop_index: u8,
-    /// α — X25519 ephemeral pubkey for this hop.
     pub alpha: [u8; ALPHA_LEN],
-    /// β — encrypted routing slots, one per hop.
     pub beta: [u8; BETA_LEN],
-    /// γ — Poly1305 MAC over (meta || α || β\[slot_i\] || trailer).
     pub gamma: [u8; GAMMA_LEN],
-    /// Random padding covered by γ.
     pub trailer: [u8; TRAILER_LEN],
 }
 
 impl Header {
-    /// Pack header to its on-wire 384-byte representation.
     pub fn encode(&self) -> [u8; HEADER_LEN] {
         let mut out = [0u8; HEADER_LEN];
         out[0] = self.version;
@@ -301,13 +148,8 @@ impl Header {
         out
     }
 
-    /// Parse on-wire bytes into a `Header`. Rejects bad version /
-    /// out-of-range hop counters.
     pub fn decode(bytes: &[u8; HEADER_LEN]) -> Result<Self> {
         let version = bytes[0];
-        // F-01 — v2 decodes so a relay CAN serve un-updated clients during a
-        // rollout. Whether it actually accepts one is a policy decision taken
-        // in `Relay::process`, not here: parsing a header is not trusting it.
         if version != VERSION && version != VERSION_LEGACY {
             return Err(Error::Malformed("unsupported header version"));
         }
@@ -340,46 +182,11 @@ impl Header {
         })
     }
 
-    /// MAC input for hop `slot_idx`.
-    ///
-    /// **VERSION 3** authenticates
-    /// `version || mode || hop_count || slot_idx || α || β[slot_idx ..] || trailer`
-    /// — this hop's slot AND every slot after it.
-    ///
-    /// **VERSION 2 covered only `β[slot_idx]`, and that was F-01, the one
-    /// finding rated critical.** The reasoning written here was that
-    /// cross-slot integrity is provided per hop, "a malicious upstream relay
-    /// rewriting slot[j] (j > i) cannot forge γ_j, so the downstream hop drops
-    /// the packet". True, and beside the point: the downstream hop in question
-    /// is the attacker's own colluding exit, which simply does not drop it. An
-    /// entry relay writes a mark into the exit's slot, the exit reads it back
-    /// byte for byte, and the packet routes correctly the whole way. That is a
-    /// deterministic entry↔exit correlation on a SINGLE packet — no timing, no
-    /// statistics, no traffic volume needed.
-    ///
-    /// Covering the suffix closes it because the first HONEST hop after the
-    /// tagger has that slot inside its own MAC and drops the packet. There is
-    /// no circularity: `wrap_header` runs its loop from `n-1` down to `0`, so
-    /// when γ_i is computed, slots `i..n` are already final and slots
-    /// `n..MAX_HOPS` hold the random filler from step 2. Slot `i-1` is a
-    /// PREFIX and is deliberately excluded — it is written afterwards.
-    ///
-    /// The unused slots `n..MAX_HOPS` becoming authenticated is not incidental:
-    /// under v2 they were covered by nobody, so an adjacent pair of relays
-    /// could signal through them with no MAC failure occurring anywhere.
-    ///
-    /// **Residual, stated rather than implied:** two ADJACENT colluding relays
-    /// can still tag, because the tagger's immediate successor is the reader
-    /// and ignores its own MAC failure. On a 3-hop path that is entry+middle or
-    /// middle+exit — neither of which links sender to recipient. Closing that
-    /// too means rebuilding β as a shifting stream with deterministic filler.
     fn mac_input_for_slot(&self, slot_idx: usize) -> Vec<u8> {
         let start = slot_idx * RECORD_LEN;
         let slot_bytes: &[u8] = if self.version >= 3 {
             &self.beta[start..]
         } else {
-            // Legacy v2 verification, kept ONLY so a relay can serve clients
-            // that have not updated yet. See `Relay::accept_header_v2`.
             &self.beta[start..start + RECORD_LEN]
         };
         let mut v = Vec::with_capacity(4 + ALPHA_LEN + slot_bytes.len() + TRAILER_LEN);
@@ -394,41 +201,16 @@ impl Header {
     }
 }
 
-// ─── Per-hop sub-keys (X25519-only) ────────────────────────────────────────
-
-/// Per-hop derived secrets used by the Sphinx unwrap pipeline.
-/// Zeroized on drop.
 #[derive(Zeroize, ZeroizeOnDrop, Clone)]
 pub struct HopSubKeys {
-    /// Poly1305 MAC key (γ verification).
     pub k_mac: [u8; 32],
-    /// ChaCha20 key for the slot's encryption.
     pub k_header: [u8; 32],
-    /// Key reserved for v0.2 per-hop payload AEAD.
     pub k_payload: [u8; 32],
-    /// Scalar used to re-blind α to the next hop.
     pub k_blind: [u8; 32],
-    /// ChaCha20 key that re-randomises the WHOLE of β and the trailer on the
-    /// way out of this hop.
-    ///
-    /// Without it, β (320 B) and the trailer (12 B) travelled byte-identical
-    /// from the first hop to the last — 332 of the header's 384 bytes were a
-    /// per-packet fingerprint. Two relays on one path (the adversary a mixnet
-    /// exists to defeat, and one that costs two cheap VPS) could join their
-    /// logs on those bytes and link sender to recipient with certainty, from a
-    /// single packet, with no timing analysis. α was already re-blinded and γ
-    /// already replaced per hop, so this was the last invariant.
     pub k_shuffle: [u8; 32],
 }
 
-/// Derive per-hop sub-keys from a 32-byte X25519 shared secret via HKDF-SHA256.
 pub fn derive_hop_subkeys(shared_x: &[u8; 32]) -> Result<HopSubKeys> {
-    // M-1 (SECURITY-AUDIT): reject the all-zero X25519 shared secret, which is
-    // produced exactly when the input point is low-order (RFC 7748 §6.1).
-    // Without this, a malicious upstream relay could substitute α with a
-    // small-order point so that every downstream hop derives the *same*
-    // predictable shared secret — collapsing the mixnet's per-hop key
-    // separation. The fold is constant-time (always scans all 32 bytes).
     if shared_x.iter().fold(0u8, |acc, &b| acc | b) == 0 {
         return Err(Error::Crypto(
             "low-order point: all-zero X25519 shared secret",
@@ -453,10 +235,6 @@ pub fn derive_hop_subkeys(shared_x: &[u8; 32]) -> Result<HopSubKeys> {
     Ok(sub)
 }
 
-// ─── Crypto helpers ─────────────────────────────────────────────────────────
-
-/// ChaCha20 keystream of `len` bytes using a fixed all-zero nonce.
-/// Safe because each `k_header` is a per-packet ephemeral and never reused.
 fn chacha20_stream(key: &[u8; 32], len: usize) -> Vec<u8> {
     let nonce = [0u8; 12];
     let mut cipher = ChaCha20::new(key.into(), (&nonce).into());
@@ -464,13 +242,6 @@ fn chacha20_stream(key: &[u8; 32], len: usize) -> Vec<u8> {
     cipher.apply_keystream(&mut buf);
     buf
 }
-
-// The per-hop payload onion now uses the LIONESS wide-block PRP — see
-// [`crate::lioness`]. The sender applies one LIONESS layer per hop
-// (inner→outer), each relay peels exactly its own with `k_payload`, and after
-// the last hop the original bytes remain. Unlike the earlier stream-cipher XOR,
-// LIONESS is non-malleable: a relay flipping any bit scrambles the whole block,
-// so it cannot tag-and-track a packet across two points of the path.
 
 fn poly1305_tag(key: &[u8; 32], data: &[u8]) -> [u8; GAMMA_LEN] {
     let mac = Poly1305::new(key.into()).compute_unpadded(data);
@@ -483,16 +254,6 @@ fn blind_alpha(alpha: &[u8; ALPHA_LEN], k_blind: &[u8; 32]) -> [u8; ALPHA_LEN] {
     x25519(*k_blind, *alpha)
 }
 
-// ─── Sender: derive_route_secrets ───────────────────────────────────────────
-
-/// Derive the chain of per-hop (α, sub-keys) given recipient public keys.
-///
-/// Uses a single ephemeral X25519 scalar at the sender; for each hop, the
-/// scalar is blinded by `k_blind_{i-1}` derived from the previous hop's
-/// shared secret, producing the chain of α values.
-///
-/// The ephemeral master scalar is zeroized before return — forward secrecy
-/// is preserved.
 pub fn derive_route_secrets<R: CryptoRng + RngCore>(
     rng: &mut R,
     recipient_pks: &[[u8; ALPHA_LEN]],
@@ -517,23 +278,6 @@ pub fn derive_route_secrets<R: CryptoRng + RngCore>(
     for (i, pk_bytes) in recipient_pks.iter().enumerate() {
         alphas.push(alpha_point.to_bytes());
         let recipient_point = MontgomeryPoint(*pk_bytes);
-        // Reject low-order / small-subgroup relay keys BEFORE using them.
-        // `pk_bytes` comes straight from a directory descriptor, so it is
-        // attacker-supplied under threat models (2) a malicious relay and (3) a
-        // malicious authority. `Mul<Scalar> for MontgomeryPoint` runs the ladder
-        // over the scalar's canonical value WITHOUT clamping, so `s_curr` is not
-        // forced to a multiple of 8: a low-order point would yield a shared
-        // secret from a tiny set, making that hop's k_header / k_payload /
-        // k_blind publicly computable — i.e. that layer of the onion is
-        // readable by anyone, and the blinding chain is pinned. `sealed.rs`
-        // already guards its DH this way (`was_contributory`); the Sphinx path
-        // must not be weaker. The all-zero-secret check in `derive_hop_subkeys`
-        // catches only the identity, not the rest of the small subgroup.
-        //
-        // `MontgomeryPoint` exposes no `is_small_order`, so clear the cofactor
-        // by hand: [8]P is the identity exactly for the points of order
-        // dividing 8, which is precisely the small subgroup. The identity in
-        // Montgomery form encodes as all-zero.
         let cofactor_cleared = recipient_point
             .mul_bits_be(core::iter::once(true).chain(core::iter::repeat_n(false, 3)));
         if cofactor_cleared.to_bytes() == [0u8; 32] {
@@ -558,17 +302,6 @@ pub fn derive_route_secrets<R: CryptoRng + RngCore>(
     Ok((alphas, sub_keys))
 }
 
-// ─── Sender: wrap_header (slot-based) ───────────────────────────────────────
-
-/// Sender-side header construction.
-///
-/// β layout: slot `i` (= bytes `i*64..(i+1)*64`) carries the encrypted
-/// routing record for hop `i`. Unused slots (`i ≥ n`) are filled with
-/// random bytes from the supplied RNG — indistinguishable from the
-/// encrypted slots at the wire level.
-///
-/// Each hop's γ is computed inside-out so the predecessor's record can
-/// carry it in its `next_gamma` field.
 pub fn wrap_header<R: CryptoRng + RngCore>(
     rng: &mut R,
     mode: u8,
@@ -585,19 +318,6 @@ pub fn wrap_header<R: CryptoRng + RngCore>(
         return Err(Error::Routing("alphas / records length mismatch"));
     }
 
-    // ── 1. Per-hop shuffle prefixes ──────────────────────────────────────
-    //
-    // Hop i XORs the whole of β‖trailer with its own keystream on the way out,
-    // so the bytes on the wire differ on every link. What hop i SEES is
-    // therefore the packet the sender built, XORed with every earlier hop's
-    // stream:
-    //
-    //     view_i = view_0 XOR S_0 XOR … XOR S_{i-1}   (prefix_i below)
-    //
-    // The sender knows every hop key, so it pre-compensates: writing
-    // `slot_i XOR prefix_i[slot_i]` into view_0 makes hop i decrypt exactly the
-    // record intended for it. prefix_0 is all-zero, i.e. the first hop sees the
-    // header verbatim.
     let shuffles: Vec<Vec<u8>> = sub_keys
         .iter()
         .map(|k| chacha20_stream(&k.k_shuffle, BETA_LEN + TRAILER_LEN))
@@ -611,33 +331,22 @@ pub fn wrap_header<R: CryptoRng + RngCore>(
         }
     }
 
-    // ── 2. Initialize β with random bytes for ALL slots ──────────────────
-    //      (real records overwrite slots 0..n; slots n..MAX_HOPS stay random)
     let mut beta = [0u8; BETA_LEN];
     rng.fill_bytes(&mut beta);
 
-    // ── 3. Encrypt slot[i] for each hop, computing γ chain inside-out ───
-    //      (γ for the last hop first, then propagate into next_gamma fields)
     let mut next_gamma = [0u8; GAMMA_LEN];
 
     for i in (0..n).rev() {
         let mut record_i = records[i];
-        // For the last hop, next_gamma is irrelevant (no next hop) but we
-        // still set it to zero for determinism.
         record_i.next_gamma = next_gamma;
 
         let record_bytes = record_i.encode();
         let stream = chacha20_stream(&sub_keys[i].k_header, RECORD_LEN);
         let offset = i * RECORD_LEN;
         for j in 0..RECORD_LEN {
-            // …XOR prefixes[i] so that after the earlier hops have shuffled,
-            // hop i reads `record_bytes ^ stream` at its own offset.
             beta[offset + j] = record_bytes[j] ^ stream[j] ^ prefixes[i][offset + j];
         }
 
-        // γ_i authenticates the header AS HOP i WILL SEE IT, so the MAC input
-        // uses that hop's view of its slot and of the trailer, not the bytes
-        // the sender happens to hold.
         let mut seen_beta = beta;
         for (j, b) in seen_beta.iter_mut().enumerate() {
             *b ^= prefixes[i][j];
@@ -653,14 +362,12 @@ pub fn wrap_header<R: CryptoRng + RngCore>(
             hop_index: i as u8,
             alpha: alphas[i],
             beta: seen_beta,
-            gamma: [0; GAMMA_LEN], // not part of MAC input
+            gamma: [0; GAMMA_LEN],
             trailer: seen_trailer,
         };
         next_gamma = poly1305_tag(&sub_keys[i].k_mac, &candidate.mac_input_for_slot(i));
     }
 
-    // After the loop, next_gamma holds γ_0 — the MAC for the first hop.
-    // prefix_0 is zero, so the emitted β and trailer are hop 0's view already.
     Ok(Header {
         version: VERSION,
         mode,
@@ -673,22 +380,11 @@ pub fn wrap_header<R: CryptoRng + RngCore>(
     })
 }
 
-// ─── Hop: unwrap_header ─────────────────────────────────────────────────────
-
-/// What a hop returns after [`unwrap_header`].
 pub struct UnwrapOutcome {
-    /// The routing record this hop just decrypted from its slot.
     pub record: RoutingRecord,
-    /// The header to forward to the next hop (re-blinded α, advanced
-    /// `hop_index`, γ taken from `record.next_gamma`).
     pub next_header: Header,
 }
 
-/// Per-hop unwrap:
-/// 1. Verify γ.
-/// 2. Decrypt slot[hop_index] to recover the routing record.
-/// 3. Re-blind α for the next hop.
-/// 4. Increment hop_index, plug `record.next_gamma` into the next header's γ.
 pub fn unwrap_header(header: &Header, sub_keys: &HopSubKeys) -> Result<UnwrapOutcome> {
     let i = header.hop_index as usize;
     let n = header.hop_count as usize;
@@ -696,13 +392,11 @@ pub fn unwrap_header(header: &Header, sub_keys: &HopSubKeys) -> Result<UnwrapOut
         return Err(Error::Malformed("hop_index/hop_count out of range"));
     }
 
-    // 1. Verify γ over (meta || α || β[slot_i] || trailer)
     let expected = poly1305_tag(&sub_keys.k_mac, &header.mac_input_for_slot(i));
     if !bool::from(expected.ct_eq(&header.gamma)) {
         return Err(Error::BadMac);
     }
 
-    // 2. Decrypt this hop's slot
     let offset = i * RECORD_LEN;
     let stream = chacha20_stream(&sub_keys.k_header, RECORD_LEN);
     let mut record_bytes = [0u8; RECORD_LEN];
@@ -711,13 +405,6 @@ pub fn unwrap_header(header: &Header, sub_keys: &HopSubKeys) -> Result<UnwrapOut
     }
     let record = RoutingRecord::decode(&record_bytes);
 
-    // 3. Build next header.
-    //
-    // Re-randomise the WHOLE of β and the trailer. Forwarding them verbatim
-    // (what v0.1 did) left 332 of 384 header bytes constant end to end, which
-    // any two relays on the path could join on to link sender and recipient
-    // deterministically. The sender pre-compensated for this stream, so the
-    // next hop still finds its own slot where it expects it.
     let next_alpha = blind_alpha(&header.alpha, &sub_keys.k_blind);
     let shuffle = chacha20_stream(&sub_keys.k_shuffle, BETA_LEN + TRAILER_LEN);
     let mut next_beta = header.beta;
@@ -744,8 +431,6 @@ pub fn unwrap_header(header: &Header, sub_keys: &HopSubKeys) -> Result<UnwrapOut
         next_header,
     })
 }
-
-// ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -837,7 +522,7 @@ mod tests {
     fn header_decode_rejects_bad_hop_count() {
         let mut bytes = [0u8; HEADER_LEN];
         bytes[0] = VERSION;
-        bytes[2] = 0; // hop_count = 0 illegal
+        bytes[2] = 0;
         assert!(matches!(Header::decode(&bytes), Err(Error::Malformed(_))));
         bytes[2] = (MAX_HOPS + 1) as u8;
         assert!(matches!(Header::decode(&bytes), Err(Error::Malformed(_))));
@@ -845,21 +530,15 @@ mod tests {
 
     #[test]
     fn derive_hop_subkeys_rejects_low_order_point() {
-        // M-1: the all-zero shared secret (produced by a low-order input point)
-        // must be rejected, so a substituted small-order α cannot force every
-        // downstream hop onto the same predictable key.
         assert!(matches!(
             derive_hop_subkeys(&[0u8; 32]),
             Err(Error::Crypto(_))
         ));
 
-        // A DH against the all-zero (low-order) Montgomery point yields the
-        // all-zero secret — exactly the relay's `x25519(sk, header.alpha)` path.
         let shared = x25519([7u8; 32], [0u8; 32]);
         assert_eq!(shared, [0u8; 32], "sanity: low-order point ⇒ all-zero DH");
         assert!(matches!(derive_hop_subkeys(&shared), Err(Error::Crypto(_))));
 
-        // A normal non-zero shared secret still derives fine.
         assert!(derive_hop_subkeys(&[1u8; 32]).is_ok());
     }
 
@@ -912,15 +591,6 @@ mod tests {
         }
     }
 
-    /// The header a relay forwards must share NO constant bytes with the one it
-    /// received, on any link of the path.
-    ///
-    /// v0.1 forwarded β and the trailer verbatim (`beta: header.beta`), so 332
-    /// of the header's 384 bytes were a per-packet fingerprint that survived
-    /// the whole route. Two relays anywhere on one path — the adversary a
-    /// mixnet exists to defeat — could join their logs on those bytes and tie
-    /// the sender's IP to the recipient with certainty, from a single packet.
-    /// No test asserted the header changed, which is exactly why it shipped.
     #[test]
     fn every_hop_emits_a_binarily_different_header() {
         for n in 2..=MAX_HOPS {
@@ -943,7 +613,6 @@ mod tests {
             )
             .unwrap();
 
-            // What each relay on the path actually observes.
             let mut seen_beta: Vec<[u8; BETA_LEN]> = Vec::new();
             let mut seen_trailer: Vec<[u8; TRAILER_LEN]> = Vec::new();
 
@@ -958,10 +627,6 @@ mod tests {
                 }
             }
 
-            // No two hops may share β or the trailer. Checked over EVERY pair,
-            // not just consecutive ones: the attack only needs two colluding
-            // relays, and they need not be adjacent — entry and exit is the
-            // worst case and the easiest to arrange.
             for a in 0..n {
                 for b in (a + 1)..n {
                     assert_ne!(
@@ -1029,7 +694,6 @@ mod tests {
 
     #[test]
     fn unwrap_rejects_tampered_own_slot() {
-        // Tampering with the slot the hop will read breaks that hop's γ.
         let mut r = rng();
         let relays = fake_relays(&mut r, 3);
         let pks: Vec<[u8; 32]> = relays.iter().map(|(_, pk)| *pk).collect();
@@ -1046,7 +710,6 @@ mod tests {
             trailer,
         )
         .unwrap();
-        // Flip a bit in slot 0 (hop 0's slot).
         header.beta[10] ^= 0x40;
         let (sk, _) = &relays[0];
         let shared = sk.diffie_hellman(&X25519PublicKey::from(header.alpha));
@@ -1057,23 +720,8 @@ mod tests {
         ));
     }
 
-    /// F-01 — a tamper in a LATER slot is caught IMMEDIATELY, not "downstream".
-    ///
-    /// This test used to be called `cross_slot_tamper_caught_downstream` and
-    /// asserted that hops 0 and 1 accept a packet whose slot 2 has been
-    /// altered, with only hop 2 rejecting it. That was the v2 behaviour, and
-    /// it was the critical finding: the hop that "catches it downstream" is
-    /// the attacker's own colluding exit, which does not catch anything — it
-    /// reads the mark and forwards the packet. A test asserting that the
-    /// tamper travels undetected through every honest hop is a test that
-    /// encodes the vulnerability as the specification.
-    ///
-    /// Under v3 each hop's MAC covers its own slot and every slot after it,
-    /// so hop 0 refuses at once.
     #[test]
     fn cross_slot_tamper_is_caught_at_the_first_honest_hop() {
-        // Tampering with slot 2 doesn't break hop 0's MAC (by design — γ_i
-        // covers only slot[i]), but DOES break hop 2's MAC.
         let mut r = rng();
         let relays = fake_relays(&mut r, 3);
         let pks: Vec<[u8; 32]> = relays.iter().map(|(_, pk)| *pk).collect();
@@ -1090,11 +738,8 @@ mod tests {
             trailer,
         )
         .unwrap();
-        // Flip a bit in slot 2 — a later hop's slot, which is exactly what a
-        // tagging entry relay does.
         header.beta[2 * RECORD_LEN + 5] ^= 0x40;
 
-        // Hop 0 REFUSES: slot 2 is inside its MAC now.
         let (sk0, _) = &relays[0];
         let shared0 = sk0.diffie_hellman(&X25519PublicKey::from(header.alpha));
         let hop_sub0 = derive_hop_subkeys(shared0.as_bytes()).unwrap();
@@ -1122,11 +767,10 @@ mod tests {
             trailer,
         )
         .unwrap();
-        header.hop_index = 1; // attacker tries to read a different slot
+        header.hop_index = 1;
         let (sk, _) = &relays[0];
         let shared = sk.diffie_hellman(&X25519PublicKey::from(header.alpha));
         let hop_sub = derive_hop_subkeys(shared.as_bytes()).unwrap();
-        // MAC includes hop_index, so this must fail.
         assert!(matches!(
             unwrap_header(&header, &hop_sub),
             Err(Error::BadMac)
@@ -1142,26 +786,14 @@ mod tests {
         assert!(res.is_err());
     }
 
-    /// Relay KEM keys come from the signed directory, so they are
-    /// attacker-supplied under a malicious relay (2) or a malicious authority
-    /// (3). A small-subgroup point collapses that hop's shared secret to one of
-    /// a handful of values, making its k_header / k_payload / k_blind publicly
-    /// computable — that onion layer becomes readable and the blinding chain
-    /// pinned. Every low-order encoding must be refused before use.
     #[test]
     fn a_low_order_relay_key_is_refused_not_silently_used() {
-        // The complete set of curve25519 Montgomery encodings of order
-        // dividing 8 (identity, order-2, order-4, order-8, and the two
-        // non-canonical p / p+1 forms).
         const LOW_ORDER: [[u8; 32]; 7] = [
-            // 0 — the identity (order 1 / 4 depending on convention)
             [0u8; 32],
-            // 1 — order 4
             [
                 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0,
             ],
-            // the two order-8 points
             [
                 0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f,
                 0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16,
@@ -1193,8 +825,6 @@ mod tests {
         let mut r = rng();
         let honest = fake_relays(&mut r, 3);
         for (i, bad) in low_order.iter().enumerate() {
-            // Put the hostile key in each hop position in turn — the check must
-            // not be limited to the first (or last) hop.
             for pos in 0..3 {
                 let mut pks: Vec<[u8; 32]> = honest.iter().map(|(_, pk)| *pk).collect();
                 pks[pos] = *bad;
@@ -1205,7 +835,6 @@ mod tests {
             }
         }
 
-        // Sanity: the guard is not rejecting honest keys.
         let pks: Vec<[u8; 32]> = honest.iter().map(|(_, pk)| *pk).collect();
         assert!(derive_route_secrets(&mut r, &pks).is_ok());
     }

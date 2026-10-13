@@ -1,21 +1,3 @@
-# Google Cloud Free Tier — 1 Gotham relay node
-#
-# Provisions a single e2-micro VM in a US region. The "Always Free"
-# tier grants ONE e2-micro per month in us-west1, us-central1, or
-# us-east1 — pick whichever is geographically furthest from your
-# Oracle regions for routing diversity.
-#
-# Requires:
-#   - A Google Cloud account with billing enabled (Free Tier still
-#     requires a payment method but doesn't bill while you stay under
-#     the quotas).
-#   - `gcloud auth application-default login` run once.
-#   - A project ID.
-#
-# Usage:
-#   export TF_VAR_project_id=your-project-id
-#   terraform -chdir=infra/google-cloud init
-#   terraform -chdir=infra/google-cloud apply
 
 terraform {
   required_version = ">= 1.5"
@@ -62,8 +44,6 @@ provider "google" {
   zone    = var.zone
 }
 
-# ─── Network ────────────────────────────────────────────────────────────
-
 resource "google_compute_network" "gotham" {
   name                    = "gotham-relay-vpc"
   auto_create_subnetworks = false
@@ -98,8 +78,6 @@ resource "google_compute_firewall" "gotham_quic" {
   direction     = "INGRESS"
 }
 
-# ─── VM ─────────────────────────────────────────────────────────────────
-
 resource "google_compute_instance" "relay" {
   name         = "gotham-relay-c"
   machine_type = "e2-micro"
@@ -116,9 +94,6 @@ resource "google_compute_instance" "relay" {
   network_interface {
     subnetwork = google_compute_subnetwork.gotham.id
     access_config {
-      # Ephemeral public IP — Free Tier doesn't include static IPs.
-      # If the VM reboots and the IP changes, re-run gen-keys.sh to
-      # rebuild the signed directory.
     }
   }
 
@@ -128,8 +103,6 @@ resource "google_compute_instance" "relay" {
 
   tags = ["gotham-relay"]
 }
-
-# ─── Outputs ────────────────────────────────────────────────────────────
 
 output "relay_c_public_ip" {
   description = "Public IP of relay C. Use this in your gotham-bootstrap.json."

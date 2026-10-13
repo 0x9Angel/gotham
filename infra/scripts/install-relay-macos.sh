@@ -1,45 +1,10 @@
 #!/usr/bin/env bash
-# install-relay-macos.sh — one-command Gotham mixnet relay installer for macOS.
-#
-# Downloads the checksum-verified prebuilt binary (Apple Silicon or Intel),
-# generates an identity key, and installs a launchd LaunchDaemon so the relay
-# is boot-persistent and auto-restarts. Run with sudo.
-#
-#   curl -fsSL https://raw.githubusercontent.com/0x9Angel/gotham-relay/main/infra/scripts/install-relay-macos.sh | sudo GOTHAM_OPERATOR=your-name bash
-#
-# Env vars (same as the Linux installer):
-#   GOTHAM_OPERATOR      REQUIRED. Public nickname identifying who runs this
-#                        relay. Path selection refuses two hops it cannot PROVE
-#                        belong to different operators, so an unlabelled relay
-#                        is never routed. Use the SAME value on every relay you
-#                        run, so diversity reflects who actually runs what.
-#   GOTHAM_ENROLL_TOKEN  Only if the authority runs in closed/token mode.
-#                        Enrollment is OPEN by default — you do NOT need one.
-#   GOTHAM_AUTHORITY_URL Directory authority URL. Default http://144.24.205.188:8443
-#   GOTHAM_EXTRA_AUTHORITY_URLS
-#                        Space-separated ADDITIONAL authorities to enroll with.
-#                        Clients need a quorum of attestations, so the default is
-#                        the other two authorities of the shipped set.
-#   GOTHAM_TIER          entry|mix|exit. Default mix.
-#   GOTHAM_PORT          UDP listen+advertise port. Default 443.
-#   GOTHAM_ADVERTISE_IP  Public IP peers reach you on. If UNSET, the relay
-#                        auto-maps its port and detects its public address via
-#                        UPnP-IGD (home routers) — no manual port-forward.
-#   GOTHAM_RENDEZVOUS    auto | on | off. Default auto: enrol via a rendezvous
-#                        point (RFC B3) when no reachable public address is
-#                        found — lets a Mac on 4G/5G / CGNAT be a relay.
 set -euo pipefail
 
 AUTHORITY_URL="${GOTHAM_AUTHORITY_URL:-http://144.24.205.188:8443}"
-# Clients admit a relay only when k of n authorities have attested it (k=2, n=3
-# in the shipped app). A relay enrolled with the primary alone runs, reports
-# itself healthy, and is dropped in silence by every client. Enrol with all three.
 EXTRA_AUTHORITY_URLS="${GOTHAM_EXTRA_AUTHORITY_URLS:-http://84.235.232.196:8443 http://84.235.228.107:8443}"
 TIER="${GOTHAM_TIER:-mix}"
 PORT="${GOTHAM_PORT:-443}"
-# Fail-closed diversity: path selection never puts two hops together unless it
-# can PROVE they belong to different operators, and an unlabelled relay counts
-# as unproven. So a relay with no label runs, looks healthy and is never used.
 OPERATOR="${GOTHAM_OPERATOR:-}"
 ENROLL_TOKEN="${GOTHAM_ENROLL_TOKEN:-}"
 REPO="0x9Angel/gotham-relay"
@@ -52,8 +17,6 @@ PLIST=/Library/LaunchDaemons/org.gotham.relay.plist
 
 [[ "$(id -u)" -eq 0 ]] || { echo "Run with sudo: sudo bash $0"; exit 1; }
 case "$TIER" in entry|mix|exit) ;; *) echo "[!] GOTHAM_TIER must be entry|mix|exit (got '$TIER')"; exit 1;; esac
-# Checked BEFORE anything is downloaded: a relay that cannot be routed is worse
-# than no relay, because nobody finds out. Better a clean refusal now.
 if [[ -z "$OPERATOR" ]]; then
     echo "[!] GOTHAM_OPERATOR is required and was not set."
     echo
@@ -69,8 +32,6 @@ if [[ -z "$OPERATOR" ]]; then
     echo "    your machines apart from everyone else's."
     exit 1
 fi
-# The label is pasted into the launchd plist, so restrict it to characters that
-# need no XML escaping and cannot smuggle a second argument.
 [[ "$OPERATOR" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || {
     echo "[!] GOTHAM_OPERATOR must be 1 to 32 characters from A-Z a-z 0-9 . _ -"
     echo "    (got '$OPERATOR')"
@@ -80,10 +41,6 @@ fi
 case "$(uname -m)" in
   arm64)  ASSET=gotham-relay-macos-aarch64 ;;
   x86_64)
-    # No Intel build is published (the release job only targets
-    # aarch64-apple-darwin), and an Apple Silicon binary cannot run on Intel —
-    # Rosetta translates the other way. Asking for it produced a bare 404 from
-    # curl with no explanation.
     echo "[!] No Intel (x86_64) macOS build is published for the Gotham relay."
     echo "    Apple Silicon binaries do not run on Intel Macs."
     echo "    Options:"
@@ -108,16 +65,14 @@ echo "[2/5] Generating relay identity (if absent)…"
 chmod 600 "$KEYFILE"
 PUBKEY="$("$BIN" pubkey --key-file "$KEYFILE")"
 
-# Decide DIRECT vs RENDEZVOUS (RFC B3 — behind CGNAT / mobile 4G-5G / broken
-# UPnP: keep an OUTBOUND tunnel to a public rendezvous relay, no inbound needed).
 PUB_IP="$(curl -fsSL --max-time 8 https://api.ipify.org || true)"
 MODE="direct"
 case "${GOTHAM_RENDEZVOUS:-auto}" in
   on|1|true)   MODE="rendezvous" ;;
   off|0|false) MODE="direct" ;;
-  *) if [[ -n "${GOTHAM_ADVERTISE_IP:-}" ]]; then MODE="direct"          # operator asserts a reachable addr
-     elif [[ -n "$PUB_IP" ]] && ifconfig 2>/dev/null | grep -qw "$PUB_IP"; then MODE="direct"  # public IP on an interface
-     else MODE="rendezvous"; fi ;;                                        # behind NAT/CGNAT
+  *) if [[ -n "${GOTHAM_ADVERTISE_IP:-}" ]]; then MODE="direct"
+     elif [[ -n "$PUB_IP" ]] && ifconfig 2>/dev/null | grep -qw "$PUB_IP"; then MODE="direct"
+     else MODE="rendezvous"; fi ;;
 esac
 
 if [[ "$MODE" == "rendezvous" ]]; then
@@ -133,8 +88,6 @@ if [[ "$MODE" == "rendezvous" ]]; then
         exit 1
     fi
     echo "    Rendezvous relay: $R_ADDR"
-    # rendezvous mode: NO --advertise-addr (a CGNAT relay has no dialable address);
-    # the PoP key is auto-fetched from /pop.
     ADVERTISE_XML="    <string>--rendezvous-key</string><string>$R_KEM</string><string>--rendezvous-addr</string><string>$R_ADDR</string>"
     ADVERTISE_MSG="via rendezvous $R_ADDR (CGNAT/B3)"
 elif [[ -n "${GOTHAM_ADVERTISE_IP:-}" ]]; then
@@ -150,8 +103,6 @@ else
     TOKEN_XML="    <!-- open enrollment: no --enroll-token needed -->"
 fi
 
-# One --extra-authority-url per additional authority; each one's PoP key is
-# auto-fetched from its own /pop, so there is nothing to paste here.
 AUTHORITIES_XML=""
 for u in $EXTRA_AUTHORITY_URLS; do
     AUTHORITIES_XML+="    <string>--extra-authority-url</string><string>$u</string>"$'\n'
@@ -193,12 +144,6 @@ launchctl bootstrap system "$PLIST"
 launchctl enable system/org.gotham.relay
 
 echo "[5/5] Waiting for the authorities to accept enrollment…"
-# Ask the AUTHORITIES, not our own log. The directory is ground truth: either
-# our public key is in the signed document or it is not. And ask all of them:
-# clients admit a relay only once k of n have attested it (k=2 today), so being
-# listed by the primary alone means the relay runs and is dropped by every
-# client. The log line 'enrolled with directory authority' this installer used
-# to point at is printed for that useless state too.
 QUORUM_NEEDED="${GOTHAM_QUORUM_NEEDED:-2}"
 ALL_AUTHORITIES="$AUTHORITY_URL $EXTRA_AUTHORITY_URLS"
 

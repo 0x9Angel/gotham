@@ -1,25 +1,3 @@
-# Oracle Cloud Always Free — 2 Gotham relay nodes
-#
-# Provisions two Ampere ARM A1.Flex VMs (1 OCPU, 6 GB RAM each) in two
-# distinct regions. Oracle's "Always Free" tier grants up to 4 OCPUs of
-# Ampere A1 globally — using 2 here leaves headroom for a third node
-# later if you want geographic diversity within Oracle alone.
-#
-# Requires:
-#   - An Oracle Cloud account with payment method validated (Always Free
-#     instances still require this — they just aren't billed).
-#   - A tenancy OCID, user OCID, fingerprint, and private API key.
-#     Generate via: https://docs.oracle.com/en-us/iaas/Content/API/Concepts/apisigningkey.htm
-#   - The OCI CLI authenticated (`oci setup config`), OR these values
-#     populated in this file's `provider "oci"` block.
-#
-# Usage:
-#   terraform -chdir=infra/oracle-cloud init
-#   terraform -chdir=infra/oracle-cloud apply
-#
-# Output: the public IPv6 addresses of the two VMs. You will SSH into
-# each and run `infra/scripts/install-relay.sh` to deploy the gotham-relay
-# daemon.
 
 terraform {
   required_version = ">= 1.5"
@@ -57,16 +35,12 @@ variable "ssh_pubkey_path" {
 provider "oci" {
   alias  = "a"
   region = var.region_a
-  # tenancy_ocid, user_ocid, fingerprint, private_key_path
-  # are picked up from ~/.oci/config by default.
 }
 
 provider "oci" {
   alias  = "b"
   region = var.region_b
 }
-
-# ─── VM #1 — region A ───────────────────────────────────────────────────
 
 resource "oci_core_vcn" "a" {
   provider       = oci.a
@@ -103,13 +77,11 @@ resource "oci_core_security_list" "a" {
     protocol    = "all"
     destination = "0.0.0.0/0"
   }
-  # SSH for operator access.
   ingress_security_rules {
     protocol = "6"
     source   = "0.0.0.0/0"
     tcp_options { min = 22, max = 22 }
   }
-  # Gotham QUIC relay port (UDP 443 — same as HTTPS for DPI camouflage).
   ingress_security_rules {
     protocol = "17"
     source   = "0.0.0.0/0"
@@ -167,8 +139,6 @@ data "oci_identity_availability_domains" "a" {
   provider       = oci.a
   compartment_id = var.compartment_ocid
 }
-
-# ─── VM #2 — region B (duplicated structure) ────────────────────────────
 
 resource "oci_core_vcn" "b" {
   provider       = oci.b
@@ -267,8 +237,6 @@ data "oci_identity_availability_domains" "b" {
   provider       = oci.b
   compartment_id = var.compartment_ocid
 }
-
-# ─── Outputs ────────────────────────────────────────────────────────────
 
 output "relay_a_public_ip" {
   description = "Public IP of relay A. Use this in your gotham-bootstrap.json."

@@ -9,21 +9,6 @@ Type=simple
 User=gotham
 Group=gotham
 WorkingDirectory=/opt/gotham
-# Config (port, authority URL, advertise addr, tier, token, optional
-# country/operator) is written to relay.env by install-relay.sh. The relay
-# reads GOTHAM_ENROLL_TOKEN from the environment; the rest are passed as flags.
-# Note: $GOTHAM_EXTRA_ARGS uses no braces on purpose so systemd word-splits it
-# into separate optional flags (--country / --operator); empty = no extra flags.
-#
-# --delay-micros is deliberately NOT passed. This unit used to pin it to 20000,
-# which silently undid the F-30 fix on every deployed relay: 20 ms sits below
-# the jitter of an ordinary internet path, so the hold cost latency and bought
-# no mixing at all. The binary's own default (500 ms, the Balanced mean) is the
-# value that mixes — let it apply. Do not re-add the flag.
-#
-# --replay-cache-path keeps the replay cache across restarts (F-25). Without it
-# a restart forgets every packet seen and a captured packet replayed afterwards
-# is accepted as fresh. The file lives under the existing ReadWritePaths below.
 EnvironmentFile=/etc/gotham/relay.env
 ExecStart=/opt/gotham/bin/gotham-relay run \
     --key-file /opt/gotham/state/relay.key \
@@ -40,7 +25,6 @@ RestartSec=5
 StartLimitInterval=200
 StartLimitBurst=5
 
-# ─── Hardening ──────────────────────────────────────────────────────────
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -63,11 +47,9 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 ReadWritePaths=/opt/gotham/state /var/log/gotham
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
-# Resource limits — kept generous for a 1-OCPU Ampere A1.
 LimitNOFILE=65536
 TasksMax=4096
 
-# Logging — counters only, never per-packet data, never IPs.
 Environment="RUST_LOG=info,crypto_gotham_relay=info"
 StandardOutput=append:/var/log/gotham/relay.log
 StandardError=append:/var/log/gotham/relay.err

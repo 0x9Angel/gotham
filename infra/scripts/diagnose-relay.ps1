@@ -1,11 +1,3 @@
-# diagnose-relay.ps1 — why won't my Gotham relay enroll?
-#
-# Runs the INSTALLED relay with the EXACT command the background Scheduled Task
-# uses (so it reproduces reality, including --advertise-addr) in the foreground
-# for ~20s, captures its output, and prints a plain-language verdict.
-#
-# Paste-safe one-liner (ELEVATED PowerShell — Run as Administrator):
-#   irm https://raw.githubusercontent.com/0x9Angel/gotham-relay/main/infra/scripts/diagnose-relay.ps1 | iex
 
 $ErrorActionPreference = "Continue"
 
@@ -19,7 +11,6 @@ $out = Join-Path $dir "diagnose.out"
 $err = Join-Path $dir "diagnose.err"
 if (-not (Test-Path $bin)) { Write-Host "Relay not installed ($bin is missing). Run the installer first." -ForegroundColor Yellow; return }
 
-# Reproduce EXACTLY what the background task runs (so --advertise-addr etc. match).
 $task = Get-ScheduledTask -TaskName GothamRelay -ErrorAction SilentlyContinue
 if ($task -and $task.Actions[0].Execute) {
     $exe    = $task.Actions[0].Execute

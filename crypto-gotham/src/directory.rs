@@ -1,39 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial
 // Copyright (C) 2026 0x9Angel.
-// See LICENSE-AGPL and LICENSE-COMMERCIAL in this crate's root.
-
-//! Directory authority — signed JSON list of available relays.
-//!
-//! The directory is the bootstrap source-of-truth for the mixnet: it
-//! enumerates which relays are live, in which tier (entry / mix / exit),
-//! and their cryptographic identity material (Ed25519 fingerprint + the
-//! X25519 KEM key Sphinx encapsulates to).
-//!
-//! ## Signature scheme
-//!
-//! `SignedDirectory = { doc, authority_pubkey, signature }` where
-//! `signature = Ed25519_sign(authority_sk, canonical_json(doc))`.
-//!
-//! Canonical JSON here means `serde_json::to_vec(&doc)` — deterministic
-//! field order (the `#[derive(Serialize)]` macro emits fields in source
-//! order) and no whitespace. Pretty-printing is forbidden in the signing
-//! path.
-//!
-//! ## v0.1 limitations (deferred to v0.2)
-//!
-//! - Single Ed25519 authority key (v0.2: N-of-M multi-sig)
-//! - JSON wire format (v0.2 may switch to MessagePack for size + canonical)
-//! - No revocation list (v0.2: signed revocation records)
-//! - No "consensus protocol" — the authority is a single source of truth
-//!
-//! ## Path selection
-//!
-//! [`PathSelector::pick`] implements the v0.1 selection algorithm:
-//! 1. Pick exactly one relay from the `Entry` tier
-//! 2. Pick the appropriate number of `Mix` relays
-//! 3. Pick exactly one relay from the `Exit` tier
-//! 4. Apply diversity constraints (no two consecutive hops from same
-//!    operator / same /16 IPv4 / same country when possible)
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::seq::SliceRandom;
@@ -44,79 +10,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 
-/// Current directory document version. Bumped on any schema change.
 pub const DIRECTORY_VERSION: u8 = 1;
 
-/// Length of an Ed25519 signature in bytes.
 pub const SIGNATURE_LEN: usize = 64;
 
-/// Length of an Ed25519 public key in bytes.
 pub const ED25519_PUBKEY_LEN: usize = 32;
 
-// ─── Types ──────────────────────────────────────────────────────────────────
-
-/// Which tier of the 3-tier mesh a relay serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RelayTier {
-    /// First hop — sees client IP.
     Entry,
-    /// Middle hop — sees only other relays.
     Mix,
-    /// Last hop — sees recipient IP.
     Exit,
 }
 
-/// One relay's published descriptor.
-///
-/// `id_pubkey_hex` is the long-term Ed25519 identity (used for signing
-/// the relay's own attestations and for the routing record's
-/// `next_node_id` field). `kem_pubkey_hex` is the X25519 key Sphinx
-/// encapsulates against.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RelayDescriptor {
-    /// Ed25519 identity public key (hex-encoded 64 chars).
     pub id_pubkey_hex: String,
-    /// X25519 KEM public key (hex-encoded 64 chars).
     pub kem_pubkey_hex: String,
-    /// Socket address — `"1.2.3.4:443"` for IPv4 or `"[::1]:443"` for IPv6.
     pub addr: String,
-    /// Tier this relay serves.
     pub tier: RelayTier,
-    /// Optional ISO 3166-1 alpha-2 country code (`"FR"`, `"DE"`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
-    /// Optional autonomous system number.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asn: Option<u32>,
-    /// Optional operator name (free-form, for transparency).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
-    /// Optional rolling uptime percentage (0.0 – 100.0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uptime_pct: Option<f32>,
-    /// Whether this relay hosts a store-and-forward [`mailbox`](crate::mailbox)
-    /// for offline delivery. Advertised so clients can pick a mailbox host;
-    /// defaults to `false` and is absent from older directories.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mailbox: bool,
-    /// RFC B3 reverse transport. When set, this relay is behind CGNAT and is
-    /// **not** directly dialable at `addr`; it is reachable only via the
-    /// rendezvous relay whose Ed25519 identity is this hex string. A path
-    /// selector must place that rendezvous relay immediately before this one,
-    /// and this relay inherits the rendezvous relay's network position for
-    /// diversity accounting. Absent (`None`) for ordinary directly-reachable
-    /// relays and older directories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rendezvous: Option<String>,
-    /// RFC B3. Whether this (directly-reachable) relay is willing to serve as a
-    /// rendezvous point for CGNAT relays. Defaults to `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rendezvous_capable: bool,
 }
 
 impl RelayDescriptor {
-    /// Decode the hex-encoded X25519 KEM pubkey into raw bytes.
     pub fn kem_pubkey_bytes(&self) -> Result<[u8; 32]> {
         let v = hex::decode(&self.kem_pubkey_hex)
             .map_err(|_| Error::Directory("bad kem_pubkey hex"))?;
@@ -128,7 +58,6 @@ impl RelayDescriptor {
         Ok(out)
     }
 
-    /// Decode the hex-encoded Ed25519 identity pubkey into raw bytes.
     pub fn id_pubkey_bytes(&self) -> Result<[u8; 32]> {
         let v =
             hex::decode(&self.id_pubkey_hex).map_err(|_| Error::Directory("bad id_pubkey hex"))?;
@@ -140,9 +69,6 @@ impl RelayDescriptor {
         Ok(out)
     }
 
-    /// Extract the IPv4 octets from the descriptor's `addr` field.
-    /// Returns `Err` if the address is IPv6 (v0.2 will switch to a typed
-    /// `SocketAddr` field).
     pub fn ipv4_octets(&self) -> Result<[u8; 4]> {
         let sa: std::net::SocketAddr = self
             .addr
@@ -154,7 +80,6 @@ impl RelayDescriptor {
         }
     }
 
-    /// Extract the port from `addr`.
     pub fn port(&self) -> Result<u16> {
         let sa: std::net::SocketAddr = self
             .addr
@@ -163,9 +88,6 @@ impl RelayDescriptor {
         Ok(sa.port())
     }
 
-    /// The relay's IP address (v4 or v6), or `None` if `addr` doesn't parse.
-    /// Used by path selection for network-diversity checks that must work for
-    /// BOTH address families (unlike [`ipv4_octets`](Self::ipv4_octets)).
     #[must_use]
     pub fn ip_addr(&self) -> Option<std::net::IpAddr> {
         self.addr
@@ -175,23 +97,15 @@ impl RelayDescriptor {
     }
 }
 
-/// The unsigned directory document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DirectoryDoc {
-    /// Schema version (must be [`DIRECTORY_VERSION`]).
     pub version: u8,
-    /// Unix-seconds timestamp at which this document becomes valid.
     pub valid_after: u64,
-    /// Unix-seconds timestamp at which this document expires.
     pub valid_until: u64,
-    /// All published relays, in canonical (descriptor.id_pubkey_hex)
-    /// order for determinism. Callers SHOULD sort before signing.
     pub relays: Vec<RelayDescriptor>,
 }
 
 impl DirectoryDoc {
-    /// Build a doc with `valid_after = now`, `valid_until = now + duration`.
-    /// Sorts `relays` by `id_pubkey_hex` for deterministic signing.
     pub fn new(relays: Vec<RelayDescriptor>, validity: std::time::Duration) -> Result<Self> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -210,27 +124,19 @@ impl DirectoryDoc {
         })
     }
 
-    /// Canonical bytes for signing — `serde_json::to_vec` (compact, no
-    /// whitespace, field order preserved by the serde derive).
     pub fn canonical_bytes(&self) -> Result<Vec<u8>> {
         serde_json::to_vec(self).map_err(|_| Error::Directory("serialize directory doc"))
     }
 }
 
-/// A signed directory document ready to publish.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SignedDirectory {
-    /// The unsigned document.
     pub doc: DirectoryDoc,
-    /// Hex-encoded Ed25519 authority public key (so recipients can pin it).
     pub authority_pubkey_hex: String,
-    /// Hex-encoded Ed25519 signature over [`DirectoryDoc::canonical_bytes`].
     pub signature_hex: String,
 }
 
 impl SignedDirectory {
-    /// Sign `doc` with `signing_key`. The authority pubkey is included
-    /// alongside so consumers can verify it matches the one they pinned.
     pub fn sign(doc: DirectoryDoc, signing_key: &SigningKey) -> Result<Self> {
         let canonical = doc.canonical_bytes()?;
         let sig: Signature = signing_key.sign(&canonical);
@@ -243,13 +149,7 @@ impl SignedDirectory {
         })
     }
 
-    /// Verify the signature against an authority public key pinned by
-    /// the caller, AND check the document's validity window.
-    ///
-    /// Returns `Ok(())` if everything checks out. Caller MUST refuse to
-    /// use the directory on any error.
     pub fn verify(&self, expected_authority: &VerifyingKey) -> Result<()> {
-        // 1. Authority pubkey check.
         let expected_bytes = expected_authority.to_bytes();
         let actual = hex::decode(&self.authority_pubkey_hex)
             .map_err(|_| Error::Directory("bad authority pubkey hex"))?;
@@ -257,7 +157,6 @@ impl SignedDirectory {
             return Err(Error::Directory("authority pubkey mismatch"));
         }
 
-        // 2. Signature check.
         let sig_bytes =
             hex::decode(&self.signature_hex).map_err(|_| Error::Directory("bad signature hex"))?;
         let sig_arr: [u8; SIGNATURE_LEN] = sig_bytes
@@ -269,14 +168,10 @@ impl SignedDirectory {
             .verify(&canonical, &sig)
             .map_err(|_| Error::Directory("signature verify failed"))?;
 
-        // 3. Schema version.
         if self.doc.version != DIRECTORY_VERSION {
             return Err(Error::Directory("unsupported directory version"));
         }
 
-        // 4. Validity window. Reject a degenerate/inverted window outright so
-        //    a malformed (but correctly signed) doc can't pass the two-sided
-        //    check inconsistently.
         if self.doc.valid_after > self.doc.valid_until {
             return Err(Error::Directory("inverted validity window"));
         }
@@ -294,22 +189,6 @@ impl SignedDirectory {
         Ok(())
     }
 
-    /// Verify, then reject anything older than the newest document already seen.
-    ///
-    /// [`verify`](Self::verify) proves authenticity but says nothing about
-    /// FRESHNESS beyond the validity window: within that window every signed
-    /// document the authority ever published is equally acceptable. A malicious
-    /// host, CDN or on-path attacker can therefore serve an OLD but still-valid
-    /// directory — one published before a misbehaving relay was removed, or with
-    /// a smaller relay set that narrows path selection toward relays the
-    /// attacker controls — and the client accepts it with no way to tell.
-    ///
-    /// `seen_valid_after` is the largest `valid_after` this client has accepted
-    /// so far (0 on first run). Because `valid_after` is inside the signed
-    /// canonical bytes, it cannot be advanced by the attacker, which makes it a
-    /// usable monotonic counter without a wire-format change.
-    ///
-    /// Returns the new high-water mark on success, for the caller to persist.
     pub fn verify_monotonic(
         &self,
         expected_authority: &VerifyingKey,
@@ -324,36 +203,20 @@ impl SignedDirectory {
         Ok(self.doc.valid_after)
     }
 
-    /// Verify like [`Self::verify`], but accept a signing authority key that is
-    /// either `pinned` OR transitively certified from `pinned` by a verified
-    /// chain of [`AuthorityKeyTransition`]s. This lets a rotated authority key
-    /// be trusted by clients that only pin the OLD key — closing the "authority
-    /// key = update-only single point of failure" gap: publish the transition
-    /// alongside the directory and existing installs adopt the new key without
-    /// an app update. Trust only ever flows old → new.
     pub fn verify_with_transitions(
         &self,
         pinned: &VerifyingKey,
         transitions: &[AuthorityKeyTransition],
     ) -> Result<()> {
-        // Bound attacker-supplied work: `transitions` is published alongside the
-        // directory, so a hostile server could pad it. A real rotation history is
-        // tiny, and the fixpoint below must not re-run Ed25519 verification once
-        // per pass (that would be O(N²) signature checks on a crafted chain).
         const MAX_TRANSITIONS: usize = 64;
         if transitions.len() > MAX_TRANSITIONS {
             return Err(Error::Directory("too many key transitions"));
         }
-        // Verify each transition's two signatures exactly ONCE, up front, into a
-        // cheap in-memory edge list (invalid edges are dropped here).
         let edges: Vec<([u8; 32], [u8; 32])> =
             transitions.iter().filter_map(|t| t.verify().ok()).collect();
 
         let actual = decode_pubkey32(&self.authority_pubkey_hex)?;
 
-        // Transitively expand the trust set over the verified edge list (HashSet
-        // lookups only, no crypto): start at the pinned key and follow each
-        // old→new edge until the set stops growing.
         let mut trusted: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         trusted.insert(pinned.to_bytes());
         loop {
@@ -368,28 +231,6 @@ impl SignedDirectory {
             }
         }
 
-        // A FORK is proof of compromise. An honest authority designates exactly
-        // one successor per key; a key that appears as the certifier of two
-        // DIFFERENT successors has signed for an attacker at least once, and we
-        // cannot tell which edge is the honest one — the transition carries no
-        // epoch to order them by. Refuse the whole chain rather than guess.
-        //
-        // Scoped to keys we TRUST, and checked after the expansion for that
-        // reason. The first version of this check ran over every edge in the
-        // list, and the list is server-supplied: anyone holding three keys of
-        // their own can mint `X→Y` and `X→Z`, both of which verify (each is
-        // signed by X and by its successor), and slipping them in refused a
-        // perfectly legitimate directory. A fork from a key nobody trusts is
-        // noise, not evidence; a fork from a key we DO trust is the attack.
-        //
-        // This is what closes the published shape of the attack ([A→B, A→EVIL]
-        // served together). It does NOT close the case where the attacker
-        // withholds A→B and serves [A→EVIL] alone to a client pinned at A: from
-        // that client's view, A simply rotated once. Closing that needs either
-        // a persisted anchor (the client remembers it adopted B, and refuses to
-        // re-derive from A) or a successor certificate co-signed by more than
-        // the retiring key — both are the wire-format work the register files
-        // under F-23/F-26, and neither is in this change.
         {
             let mut successor: std::collections::HashMap<[u8; 32], [u8; 32]> =
                 std::collections::HashMap::new();
@@ -404,40 +245,6 @@ impl SignedDirectory {
             }
         }
 
-        // F-26 — a key that has been rotated AWAY from may no longer SIGN.
-        //
-        // The set above was previously used as-is, and the early exit stopped
-        // expanding the moment `actual` became reachable. Both were wrong in
-        // the same direction: the pinned key went in unconditionally and
-        // nothing ever took it out, so after a rotation the OLD key kept
-        // signing directories that every client accepted.
-        //
-        // Be precise about what this buys, because the first version of this
-        // comment overstated it. A superseded key is refused as a SIGNER of
-        // directories. It is NOT stripped of the power to CERTIFY a successor:
-        // the fork check above catches it doing so twice, but a leaked key
-        // whose honest rotation is withheld from the client still mints one
-        // successor that client accepts. So this handles a LOST key and a
-        // stale directory replayed against a client that already holds the
-        // transition; it does not, by itself, contain a COMPROMISED key. That
-        // containment is the k-of-n co-signature + persisted anchor work.
-        //
-        // Superseding is authority-only: an edge needs the OLD key's signature
-        // as well as the new one (`AuthorityKeyTransition::verify`), so nobody
-        // can revoke a key they do not already hold — no denial of service.
-        //
-        // Two self-inflicted shapes to know about, both requiring the
-        // authority's own keys and therefore not attacks. A cycle (A→B, B→A)
-        // supersedes BOTH and locks every key out of signing. And once a
-        // successor is lost there is no way back: the predecessor can neither
-        // sign (superseded) nor certify a replacement (that would fork). Both
-        // are fixed by the same epoch + co-signature work as the rest of the
-        // F-26 residual, and until then the operational rule is: keep the
-        // predecessor offline, never rotate back.
-        //
-        // The early exit had to go with it: expansion must run to the fixpoint,
-        // or a key superseded by an edge we stopped short of reading would
-        // still be accepted. The work stays bounded by MAX_TRANSITIONS.
         let superseded: std::collections::HashSet<[u8; 32]> =
             edges.iter().map(|(old_pub, _)| *old_pub).collect();
 
@@ -453,44 +260,29 @@ impl SignedDirectory {
         }
         let signer = VerifyingKey::from_bytes(&actual)
             .map_err(|_| Error::Directory("bad authority pubkey"))?;
-        // Reuse the full check (pubkey match, signature, schema, validity window).
         self.verify(&signer)
     }
 
-    /// Serialize to a pretty-printed JSON string for publication.
-    /// (Signing uses canonical compact JSON internally — pretty output
-    /// is purely for human inspection; consumers always re-canonicalize.)
     pub fn to_json_pretty(&self) -> Result<String> {
         serde_json::to_string_pretty(self).map_err(|_| Error::Directory("serialize signed doc"))
     }
 
-    /// Parse from a JSON byte slice. Does NOT verify the signature —
-    /// always call [`Self::verify`] after parsing.
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         serde_json::from_slice(bytes).map_err(|_| Error::Directory("parse signed doc"))
     }
 }
 
-// ─── Path selection ─────────────────────────────────────────────────────────
-
-/// A selected path through the mesh: ordered list of relay descriptors.
 #[derive(Debug, Clone)]
 pub struct SelectedPath<'a> {
-    /// Hops in order from entry to exit.
     pub hops: Vec<&'a RelayDescriptor>,
 }
 
-/// Pick a path through the mesh subject to v0.1 diversity rules.
 pub struct PathSelector<'a> {
     relays: &'a [RelayDescriptor],
-    /// F-38 — the ENTRY GUARD set: `id_pubkey_hex` of the relays this client
-    /// is willing to use as its first hop. Empty means "any entry", which is
-    /// the pre-guard behaviour.
     guards: &'a [String],
 }
 
 impl<'a> PathSelector<'a> {
-    /// Wrap a slice of descriptors for path selection.
     #[must_use]
     pub fn new(relays: &'a [RelayDescriptor]) -> Self {
         Self {
@@ -499,33 +291,12 @@ impl<'a> PathSelector<'a> {
         }
     }
 
-    /// Restrict the ENTRY hop to a pinned set — Tor's entry-guard idea.
-    ///
-    /// F-38 — a fresh entry drawn uniformly for every packet is a guarantee of
-    /// eventual discovery, not a defence. A client that touches `k` of the `n`
-    /// entries at random meets an adversary-run one with probability
-    /// `1 - (1 - m/n)^k` — and at one packet per Poisson tick, `k` is roughly
-    /// 8640 a day. The question stops being *whether* an attacker sees this
-    /// client's real IP and becomes *when*, and "when" is hours.
-    ///
-    /// Pinning inverts it: the client either picked a hostile guard at the
-    /// start, with probability `m/n` and no repeats, or it never will. Same
-    /// reasoning Tor adopted in 2005 after exactly this analysis.
-    ///
-    /// Purely client-side — nothing about it appears on the wire.
     #[must_use]
     pub fn with_guards(mut self, guards: &'a [String]) -> Self {
         self.guards = guards;
         self
     }
 
-    /// The entry pool this selector may draw from.
-    ///
-    /// Falls back to the full pool when the guards are unknown to the current
-    /// directory — a guard that has left the network must not take the client
-    /// offline. The caller detects that case by comparing the returned length
-    /// and rotates; failing closed here would turn one relay's retirement into
-    /// an outage for everyone who pinned it.
     fn entry_pool<'p>(&self, entries: Vec<&'p RelayDescriptor>) -> Vec<&'p RelayDescriptor> {
         if self.guards.is_empty() {
             return entries;
@@ -546,31 +317,12 @@ impl<'a> PathSelector<'a> {
         }
     }
 
-    /// Pick one path with `hop_count` total hops (`3 ≤ hop_count ≤ 5`).
-    ///
-    /// Constraints applied (in order):
-    /// 1. First hop must be from `Entry` tier
-    /// 2. Last hop must be from `Exit` tier
-    /// 3. Intermediate hops from `Mix` tier
-    /// 4. No relay appears twice
-    /// 5. No two hops **anywhere on the path** share an operator (if
-    ///    `operator` present) — in particular entry ≠ exit operator, which
-    ///    defeats single-operator sender↔recipient correlation
-    /// 6. No two hops **anywhere on the path** share a /16 IPv4 prefix
-    /// 7. Best-effort country diversity (warn but don't fail)
-    ///
-    /// Returns `Err` if not enough relays exist to satisfy constraints.
     pub fn pick<R: Rng>(&self, rng: &mut R, hop_count: usize) -> Result<SelectedPath<'a>> {
         if !(3..=5).contains(&hop_count) {
             return Err(Error::Directory("hop_count must be 3..=5"));
         }
         let mix_count = hop_count - 2;
 
-        // RFC B3: a rendezvous-hosted (CGNAT) relay is usable only as a MIDDLE
-        // hop, and only spliced immediately AFTER its rendezvous relay R (see the
-        // mix loop). It is never an entry or exit (those see the client /
-        // recipient IP and a CGNAT relay has none). Entry/exit pools therefore
-        // exclude hosted relays; the mix pool includes them.
         let by_id = index_by_id(self.relays);
         let entries: Vec<&RelayDescriptor> = self
             .relays
@@ -599,7 +351,6 @@ impl<'a> PathSelector<'a> {
             return Err(Error::Directory("no exit relays available"));
         }
 
-        // Try up to N times to find a path satisfying the diversity constraints.
         const MAX_TRIES: usize = 32;
         for _ in 0..MAX_TRIES {
             let mut hops: Vec<&RelayDescriptor> = Vec::with_capacity(hop_count);
@@ -616,21 +367,14 @@ impl<'a> PathSelector<'a> {
                 .filter(|m| !used_ids.contains(m.id_pubkey_hex.as_str()))
                 .collect();
             chosen_mixes.shuffle(rng);
-            // Place `mix_count` middle hops. A rendezvous-hosted mix N is spliced
-            // as its rendezvous relay R followed by N (R is a transparent extra
-            // hop that does not count toward mix_count); the R→N adjacency is
-            // exempt from the /16 rule (they share a network by construction),
-            // and N inherits R's position so it is already diverse against the
-            // prefix.
             let mut mixes_placed = 0usize;
             for m in chosen_mixes.iter() {
                 if mixes_placed == mix_count {
                     break;
                 }
                 if let Some(r_hex) = m.rendezvous.as_deref() {
-                    // Hosted mix: resolve + splice R.
                     let Some(r) = by_id.get(r_hex).copied() else {
-                        continue; // R absent from the directory → not routable
+                        continue;
                     };
                     if r.rendezvous.is_some()
                         || !r.rendezvous_capable
@@ -645,7 +389,6 @@ impl<'a> PathSelector<'a> {
                     used_ids.insert(&m.id_pubkey_hex);
                     mixes_placed += 1;
                 } else {
-                    // Direct mix: diverse against the ENTIRE prefix.
                     if !path_diverse(&hops, m, &by_id) {
                         continue;
                     }
@@ -661,8 +404,6 @@ impl<'a> PathSelector<'a> {
             let candidate_exits: Vec<&&RelayDescriptor> = exits
                 .iter()
                 .filter(|e| !used_ids.contains(e.id_pubkey_hex.as_str()))
-                // Exit must be diverse from EVERY prior hop — crucially the
-                // entry — so no single operator sits on both ends of the flow.
                 .filter(|e| path_diverse(&hops, e, &by_id))
                 .collect();
             let Some(exit) = candidate_exits.choose(rng) else {
@@ -678,13 +419,6 @@ impl<'a> PathSelector<'a> {
         ))
     }
 
-    /// Like [`pick`](Self::pick), but the LAST hop is forced to `exit` (a
-    /// specific relay) instead of a random Exit-tier node. Used to route a
-    /// message to a chosen relay — e.g. a store-and-forward mailbox host — so a
-    /// deposit can ride the mixnet (hiding the depositor's IP) instead of a
-    /// direct connection. Entry + mixes are still diversity-selected and never
-    /// reuse `exit`. `exit`'s advertised tier is ignored (the caller chose it on
-    /// purpose); only the /16 + operator adjacency rule to the last mix applies.
     pub fn pick_to_exit<R: Rng>(
         &self,
         rng: &mut R,
@@ -696,8 +430,6 @@ impl<'a> PathSelector<'a> {
         }
         let mix_count = hop_count - 2;
 
-        // RFC B3: rendezvous-hosted relays are not routable until Phase 2 — see
-        // `pick`. (`exit` is caller-forced; the caller owns its routability.)
         let by_id = index_by_id(self.relays);
         let entries: Vec<&RelayDescriptor> = self
             .relays
@@ -749,9 +481,6 @@ impl<'a> PathSelector<'a> {
                 continue;
             }
 
-            // Force the chosen exit — but it must still be diverse from every
-            // prior hop (entry included), so the forced exit can never collude
-            // with the entry operator to correlate sender↔recipient.
             if !path_diverse(&hops, exit, &by_id) {
                 continue;
             }
@@ -765,16 +494,6 @@ impl<'a> PathSelector<'a> {
     }
 }
 
-/// True if `cand` is diverse (operator + /16) against **every** relay already
-/// in `existing` — not just the last one. This is what closes the
-/// single-operator end-to-end correlation attack: if diversity were only
-/// checked between consecutive hops, one operator could run both the entry and
-/// the exit of the same flow (adjacent to neither of its own nodes) and observe
-/// the sender IP at the entry and the recipient IP at the exit simultaneously.
-/// Enforcing diversity against the whole prefix guarantees no operator (and no
-/// /16) appears twice anywhere on the path, so entry and exit are always
-/// distinct operators / networks.
-/// Index identity-hex → descriptor, for RFC B3 rendezvous resolution.
 type IdIndex<'a> = std::collections::HashMap<&'a str, &'a RelayDescriptor>;
 
 fn index_by_id(relays: &[RelayDescriptor]) -> IdIndex<'_> {
@@ -784,13 +503,6 @@ fn index_by_id(relays: &[RelayDescriptor]) -> IdIndex<'_> {
         .collect()
 }
 
-/// The IP address a descriptor occupies for DIVERSITY purposes. RFC B3: a
-/// rendezvous-hosted relay (`rendezvous` set) has no address of its own — it
-/// sits behind its rendezvous relay R and therefore INHERITS R's network
-/// position. Without this, an adversary could multiply its subnet/operator share
-/// by hiding many relays behind one R and defeat the network-diversity guarantee.
-/// Returns `None` when the relay is rendezvous-hosted but R is absent from the
-/// set (it is then unroutable and never selected).
 fn eff_diversity_ip(d: &RelayDescriptor, by_id: &IdIndex) -> Option<std::net::IpAddr> {
     match &d.rendezvous {
         Some(rid) => by_id.get(rid.as_str()).and_then(|r| r.ip_addr()),
@@ -798,9 +510,6 @@ fn eff_diversity_ip(d: &RelayDescriptor, by_id: &IdIndex) -> Option<std::net::Ip
     }
 }
 
-/// The operator label a descriptor occupies for diversity. RFC B3: a rendezvous-
-/// hosted relay inherits its rendezvous relay R's operator, so an operator cannot
-/// dodge the per-operator cap by hiding relays behind its own rendezvous point.
 fn eff_operator<'a>(d: &'a RelayDescriptor, by_id: &IdIndex<'a>) -> Option<&'a str> {
     match &d.rendezvous {
         Some(rid) => by_id
@@ -815,41 +524,16 @@ fn path_diverse(existing: &[&RelayDescriptor], cand: &RelayDescriptor, by_id: &I
     existing.iter().all(|h| pair_diverse(h, cand, by_id))
 }
 
-/// True if `a` and `b` may share a path (operator + /16 diversity). RFC B3
-/// rendezvous-hosted relays are compared on their rendezvous relay's network
-/// position (see [`eff_diversity_ip`]).
 fn pair_diverse(a: &RelayDescriptor, b: &RelayDescriptor, by_id: &IdIndex) -> bool {
-    // Operator diversity, FAIL CLOSED.
-    //
-    // This used to be enforced only when BOTH relays carried a label, which
-    // made it inert exactly where it mattered: an attacker enrolling two relays
-    // simply omits the operator field and the rule never fires. Only the /16
-    // check remained, and two VPS at two providers satisfy it — which is the
-    // whole cost of putting one adversary at both ends of a path. The product
-    // states plainly that entry and exit are never the same operator, so an
-    // UNPROVEN operator must not count as a different one.
-    //
-    // A label is trustworthy because the authority binds it into the signed
-    // attestation (see crypto-gotham-directory::attestation) and the roster
-    // projects it onto the descriptor. No label means no proof, so two
-    // unlabelled relays may not share a path.
     match (eff_operator(a, by_id), eff_operator(b, by_id)) {
         (Some(op_a), Some(op_b)) if op_a == op_b => return false,
         (Some(_), Some(_)) => {}
-        // At least one side is unattested: we cannot show they differ.
         _ => return false,
     }
     let (ea, eb) = (eff_diversity_ip(a, by_id), eff_diversity_ip(b, by_id));
-    // Fail CLOSED: a rendezvous-hosted relay whose R is absent has no resolvable
-    // network position — treat it as NON-diverse, never silently diverse (which
-    // the `if let (Some, Some)` below would otherwise do).
     if (a.rendezvous.is_some() && ea.is_none()) || (b.rendezvous.is_some() && eb.is_none()) {
         return false;
     }
-    // Network diversity: reject same /16 (IPv4) or same /48 (IPv6). Enforced
-    // whenever both effective addresses parse; non-routable addresses never reach
-    // a signed production directory (rejected at enrollment/ingest), so the
-    // loopback relaxation below only ever fires for local integration tests.
     if let (Some(ip_a), Some(ip_b)) = (ea, eb) {
         if !network_diverse(ip_a, ip_b) {
             return false;
@@ -858,67 +542,36 @@ fn pair_diverse(a: &RelayDescriptor, b: &RelayDescriptor, by_id: &IdIndex) -> bo
     true
 }
 
-/// True if `a` and `b` sit in different network blocks: different /16 for IPv4
-/// (different /48 for IPv6), i.e. they may share a path. Two loopback addresses
-/// are treated as diverse ONLY so local integration tests can stand up several
-/// relays on 127.0.0.0/8; production directories never carry loopback (ingest
-/// rejects it — see [`crate::enroll::RelayEnrollment::validate`]).
 fn network_diverse(a: std::net::IpAddr, b: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
     match (a, b) {
         (IpAddr::V4(a), IpAddr::V4(b)) => {
             let (oa, ob) = (a.octets(), b.octets());
             if a.is_loopback() && b.is_loopback() {
-                return true; // test-only relaxation
+                return true;
             }
             oa[0] != ob[0] || oa[1] != ob[1]
         }
         (IpAddr::V6(a), IpAddr::V6(b)) => {
             let (oa, ob) = (a.octets(), b.octets());
             if a.is_loopback() && b.is_loopback() {
-                return true; // test-only relaxation
+                return true;
             }
-            // /48 = first 6 bytes.
             oa[..6] != ob[..6]
         }
-        // Mixed families can't collide on a subnet.
         _ => true,
     }
 }
 
-/// Directory-wide anti-Sybil concentration caps.
-///
-/// `pair_diverse`/`path_diverse` bound diversity along a SINGLE selected path;
-/// they do not bound how much of the WHOLE directory one actor controls. These
-/// caps do: at directory-build time we keep at most this many relays per IPv4
-/// /24 and /16 (per IPv6 /48), and per operator label — so an adversary who
-/// floods relays from one subnet or operator cannot buy a proportional share of
-/// path selection. Mixnet compromise scales ~ (adversary fraction)^2 at the
-/// first+last hop, so bounding population share is the load-bearing control on
-/// an open network.
 pub const MAX_RELAYS_PER_24: usize = 3;
-/// Max relays kept per IPv4 /16. See [`MAX_RELAYS_PER_24`].
 pub const MAX_RELAYS_PER_16: usize = 8;
-/// Max relays kept per IPv6 /48. See [`MAX_RELAYS_PER_24`].
 pub const MAX_RELAYS_PER_48: usize = 8;
-/// Max relays kept per operator label (only enforced when the label is set).
 pub const MAX_RELAYS_PER_OPERATOR: usize = 5;
 
-/// Enforce the directory-wide concentration caps above, returning the retained
-/// descriptors. The input SHOULD already be in a deterministic order (the
-/// authority sorts by identity key first) so the retained set is reproducible
-/// and the signature stable; within each over-subscribed bucket the earliest
-/// entries in that order are kept.
 pub fn apply_diversity_caps(descriptors: Vec<RelayDescriptor>) -> Vec<RelayDescriptor> {
     use std::collections::HashMap;
     use std::net::IpAddr;
 
-    // RFC B3: resolve each relay's EFFECTIVE diversity IP before consuming the
-    // vec — a rendezvous-hosted relay inherits its rendezvous R's network
-    // position, so it counts against R's /24 //16 //48 budget. Without this an
-    // adversary would hide many relays behind one R and buy extra subnet share.
-    // Positional (index-aligned with `descriptors`), NOT keyed by identity, so
-    // it is robust to duplicate identity keys.
     #[allow(clippy::type_complexity)]
     let (eff_ips, eff_ops): (Vec<Option<IpAddr>>, Vec<Option<String>>) = {
         let by_id = index_by_id(&descriptors);
@@ -942,14 +595,10 @@ pub fn apply_diversity_caps(descriptors: Vec<RelayDescriptor>) -> Vec<RelayDescr
     for (i, d) in descriptors.into_iter().enumerate() {
         let ip = eff_ips[i];
 
-        // RFC B3: a rendezvous-hosted relay whose R is absent has no network
-        // position — it is unroutable AND (with ip == None) would escape the
-        // caps entirely. Drop it rather than keep it uncapped.
         if d.rendezvous.is_some() && ip.is_none() {
             continue;
         }
 
-        // Network concentration.
         let net_ok = match ip {
             Some(IpAddr::V4(v4)) => {
                 let o = v4.octets();
@@ -962,11 +611,9 @@ pub fn apply_diversity_caps(descriptors: Vec<RelayDescriptor>) -> Vec<RelayDescr
                 k.copy_from_slice(&o[..6]);
                 per48.get(&k).copied().unwrap_or(0) < MAX_RELAYS_PER_48
             }
-            // Unparseable addresses are rejected at enrollment; don't cap-drop.
             None => true,
         };
 
-        // Operator concentration (effective label — a hosted relay inherits R's).
         let op_ok = match eff_ops[i].as_deref() {
             Some(op) => per_op.get(op).copied().unwrap_or(0) < MAX_RELAYS_PER_OPERATOR,
             None => true,
@@ -976,7 +623,6 @@ pub fn apply_diversity_caps(descriptors: Vec<RelayDescriptor>) -> Vec<RelayDescr
             continue;
         }
 
-        // Commit the counts for the retained relay.
         match ip {
             Some(IpAddr::V4(v4)) => {
                 let o = v4.octets();
@@ -999,9 +645,6 @@ pub fn apply_diversity_caps(descriptors: Vec<RelayDescriptor>) -> Vec<RelayDescr
     kept
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
-
-/// Decode a hex string into a 32-byte Ed25519 public key.
 fn decode_pubkey32(hex_str: &str) -> Result<[u8; 32]> {
     hex::decode(hex_str)
         .ok()
@@ -1009,7 +652,6 @@ fn decode_pubkey32(hex_str: &str) -> Result<[u8; 32]> {
         .ok_or(Error::Directory("authority key not 32-byte hex"))
 }
 
-/// Verify a detached hex signature over `msg` under the given pubkey bytes.
 fn verify_detached(pub_bytes: &[u8; 32], msg: &[u8], sig_hex: &str) -> Result<()> {
     let vk = VerifyingKey::from_bytes(pub_bytes)
         .map_err(|_| Error::Directory("bad authority pubkey"))?;
@@ -1021,30 +663,17 @@ fn verify_detached(pub_bytes: &[u8; 32], msg: &[u8], sig_hex: &str) -> Result<()
         .map_err(|_| Error::Directory("transition signature verify failed"))
 }
 
-/// A signed directory-authority key transition (rotation) certificate.
-///
-/// The OLD authority key certifies its successor and the NEW key proves
-/// possession — both sign the same domain-separated statement. Published
-/// alongside the directory so clients that only pin the OLD key can adopt the
-/// rotated key without an app update (see
-/// [`SignedDirectory::verify_with_transitions`]). Trust flows old → new only,
-/// so a compromised NEW key can never certify itself back onto an old anchor.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AuthorityKeyTransition {
-    /// Hex-encoded Ed25519 pubkey of the outgoing (certifying) authority key.
     pub old_pubkey_hex: String,
-    /// Hex-encoded Ed25519 pubkey of the incoming (successor) authority key.
     pub new_pubkey_hex: String,
-    /// `old` key's signature over [`Self::signing_bytes`].
     pub sig_old_hex: String,
-    /// `new` key's signature over [`Self::signing_bytes`] (proof of possession).
     pub sig_new_hex: String,
 }
 
 impl AuthorityKeyTransition {
     const DOMAIN: &'static [u8] = b"gotham-authority-transition-v1";
 
-    /// Canonical bytes both keys sign: `DOMAIN || old_pub(32) || new_pub(32)`.
     fn signing_bytes(old_pub: &[u8; 32], new_pub: &[u8; 32]) -> Vec<u8> {
         let mut b = Vec::with_capacity(Self::DOMAIN.len() + 64);
         b.extend_from_slice(Self::DOMAIN);
@@ -1053,16 +682,6 @@ impl AuthorityKeyTransition {
         b
     }
 
-    /// Build a transition certifying `new` as the successor of `old`. Sign it
-    /// with the OFFLINE/HSM-held old key.
-    ///
-    /// **Order of operations, and it is not the obvious one.** Switch the
-    /// online signer to `new` FIRST, then publish this transition. Publishing
-    /// it while `old` is still signing directories refuses every client for
-    /// the length of the window: the transition retires `old` as a signer the
-    /// moment a client reads it, and `new` has not signed anything yet. The
-    /// earlier wording here said to publish first, which prescribed exactly
-    /// that outage.
     pub fn build(old: &SigningKey, new: &SigningKey) -> Self {
         let old_pub = old.verifying_key().to_bytes();
         let new_pub = new.verifying_key().to_bytes();
@@ -1075,8 +694,6 @@ impl AuthorityKeyTransition {
         }
     }
 
-    /// Verify BOTH signatures over the canonical statement. Returns
-    /// `(old_pubkey, new_pubkey)` on success.
     pub fn verify(&self) -> Result<([u8; 32], [u8; 32])> {
         let old_pub = decode_pubkey32(&self.old_pubkey_hex)?;
         let new_pub = decode_pubkey32(&self.new_pubkey_hex)?;
@@ -1113,18 +730,6 @@ mod tests {
         }
     }
 
-    /// Two relays with no attested operator may not share a path.
-    ///
-    /// The rule used to fire only when BOTH carried a label, so an attacker
-    /// enrolling two relays just omitted the operator field and the check never
-    /// ran — leaving only the /16 rule, which two VPS at two providers satisfy.
-    /// That is the entire cost of sitting at both ends of a path, and it is
-    /// what makes header correlation (see crypto-gotham::header) worth
-    /// attempting. Every relay in the live fleet carried `operator: None` while
-    /// the site stated entry and exit are never the same operator.
-    ///
-    /// Every test relay in this module is labelled, which is precisely why the
-    /// hole survived: nothing exercised the unlabelled case.
     #[test]
     fn an_unattested_operator_never_counts_as_a_different_one() {
         let unlabelled = |name: &str, ip: [u8; 4]| {
@@ -1134,8 +739,6 @@ mod tests {
         };
         let by_id: IdIndex = std::collections::HashMap::new();
 
-        // Different /16s, so the network rule is satisfied and only the
-        // operator rule can reject them.
         let a = unlabelled("a", [203, 0, 113, 1]);
         let b = unlabelled("b", [198, 51, 100, 1]);
         assert!(
@@ -1143,7 +746,6 @@ mod tests {
             "two unlabelled relays must NOT be treated as different operators"
         );
 
-        // One side labelled is still no proof they differ.
         let mut c = unlabelled("c", [192, 0, 2, 1]);
         c.operator = Some("acme".into());
         assert!(
@@ -1151,7 +753,6 @@ mod tests {
             "an unlabelled relay paired with a labelled one is still unproven"
         );
 
-        // Two distinct attested operators on distinct networks: allowed.
         let d = fake_relay("d", RelayTier::Mix, [203, 0, 113, 2], "acme");
         let e = fake_relay("e", RelayTier::Mix, [198, 51, 100, 2], "globex");
         assert!(
@@ -1162,20 +763,16 @@ mod tests {
 
     #[test]
     fn diversity_caps_bound_subnet_and_operator() {
-        // Distinct operators so the operator cap never masks the network caps.
         let mk = |i: usize, ip: [u8; 4]| {
             fake_relay(&format!("r{i}"), RelayTier::Mix, ip, &format!("op{i}"))
         };
 
-        // 6 relays in 203.0.113.0/24 → capped to the /24 limit.
         let same24: Vec<_> = (1..=6).map(|i| mk(i, [203, 0, 113, i as u8])).collect();
         assert_eq!(apply_diversity_caps(same24).len(), MAX_RELAYS_PER_24);
 
-        // 20 relays across distinct /24s of one /16 → capped to the /16 limit.
         let same16: Vec<_> = (0..20).map(|i| mk(i, [198, 51, i as u8, 1])).collect();
         assert_eq!(apply_diversity_caps(same16).len(), MAX_RELAYS_PER_16);
 
-        // 20 relays, one operator, all distinct /16s → capped to the operator limit.
         let same_op: Vec<_> = (0..20)
             .map(|i| {
                 fake_relay(
@@ -1188,7 +785,6 @@ mod tests {
             .collect();
         assert_eq!(apply_diversity_caps(same_op).len(), MAX_RELAYS_PER_OPERATOR);
 
-        // Fully diverse relays (distinct /16 + operator) are all kept.
         let diverse: Vec<_> = (0..10)
             .map(|i| mk(i, [70 + i as u8, 80 + i as u8, 0, 1]))
             .collect();
@@ -1236,23 +832,15 @@ mod tests {
         assert_eq!(o, old.verifying_key().to_bytes());
         assert_eq!(n, new.verifying_key().to_bytes());
 
-        // A directory signed by the NEW key is rejected by the OLD pin alone…
         let r1 = fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1");
         let doc = DirectoryDoc::new(vec![r1], std::time::Duration::from_secs(86_400)).unwrap();
         let signed = SignedDirectory::sign(doc, &new).unwrap();
         assert!(signed.verify(&old.verifying_key()).is_err());
-        // …but accepted once the transition chain from the pinned old key is given.
         signed
             .verify_with_transitions(&old.verifying_key(), std::slice::from_ref(&t))
             .expect("rotated key trusted via transition");
     }
 
-    /// F-26 — rotating away from a key must actually RETIRE it.
-    ///
-    /// This is the half that made the mechanism cosmetic: the pinned key went
-    /// into the trust set unconditionally and nothing removed it, so a key
-    /// rotated away from — the one being rotated precisely because it is
-    /// suspect — kept signing directories every client accepted.
     #[test]
     fn a_superseded_authority_key_is_refused() {
         let old = SigningKey::from_bytes(&[1u8; 32]);
@@ -1262,9 +850,6 @@ mod tests {
         let r1 = fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1");
         let doc = DirectoryDoc::new(vec![r1], std::time::Duration::from_secs(86_400)).unwrap();
 
-        // The OLD key signs a directory and presents the very transition that
-        // retired it. Before the fix this verified: the pinned key was trusted
-        // unconditionally and the rotation was pure decoration.
         let by_old = SignedDirectory::sign(doc.clone(), &old).unwrap();
         assert!(
             by_old
@@ -1273,16 +858,12 @@ mod tests {
             "a key that has been rotated away from must not sign directories",
         );
 
-        // The successor still works — revocation must not break rotation.
         let by_new = SignedDirectory::sign(doc, &new).unwrap();
         by_new
             .verify_with_transitions(&old.verifying_key(), std::slice::from_ref(&t))
             .expect("the successor key is the live one");
     }
 
-    /// Along a chain A → B → C, only C signs. B is both reachable and
-    /// superseded, and reachability used to win because expansion stopped as
-    /// soon as the signer was found — so a mid-chain key stayed valid forever.
     #[test]
     fn a_mid_chain_authority_key_is_refused() {
         let a = SigningKey::from_bytes(&[1u8; 32]);
@@ -1312,13 +893,6 @@ mod tests {
             .expect("only the end of the chain signs");
     }
 
-    /// A key that certifies two different successors has signed for an
-    /// attacker at least once. With no epoch to order the edges, the honest
-    /// one cannot be told from the forged one — refuse the whole chain.
-    ///
-    /// This is the published shape of the attack the review found: A leaks,
-    /// the attacker serves [A→B, A→EVIL] with a directory signed by EVIL.
-    /// Before this check, `trusted = {A, B, EVIL}` and it verified.
     #[test]
     fn a_forked_transition_chain_is_refused_outright() {
         let a = SigningKey::from_bytes(&[1u8; 32]);
@@ -1344,7 +918,6 @@ mod tests {
                 "a forked chain must be refused even for {who}: the fork itself is the evidence",
             );
         }
-        // The same edge listed twice is not a fork.
         let dup = vec![
             AuthorityKeyTransition::build(&a, &b),
             AuthorityKeyTransition::build(&a, &b),
@@ -1355,15 +928,10 @@ mod tests {
             .expect("a duplicated edge is redundant, not contradictory");
     }
 
-    /// The list of transitions is server-supplied. A fork among keys NOBODY
-    /// trusts must not refuse a legitimate directory — the first version of the
-    /// fork check was global, and two junk edges from any attacker-held key
-    /// were enough to deny every client its directory.
     #[test]
     fn a_fork_among_untrusted_keys_is_noise_not_a_refusal() {
         let a = SigningKey::from_bytes(&[1u8; 32]);
         let b = SigningKey::from_bytes(&[2u8; 32]);
-        // Three keys the attacker simply generated. Both edges verify.
         let x = SigningKey::from_bytes(&[7u8; 32]);
         let y = SigningKey::from_bytes(&[8u8; 32]);
         let z = SigningKey::from_bytes(&[9u8; 32]);
@@ -1381,12 +949,6 @@ mod tests {
             .expect("junk edges from keys we never trusted must not deny service");
     }
 
-    /// The honest limit of the mechanism, pinned so nobody reads more into it:
-    /// a client pinned at A that is shown ONLY [A→EVIL] accepts EVIL. There is
-    /// nothing in the transition to say A had already rotated elsewhere. This
-    /// is the case that needs a persisted anchor or a co-signed certificate,
-    /// and this test exists to fail the day either lands, so the comment and
-    /// the register get updated with it.
     #[test]
     fn a_withheld_rotation_still_lets_a_leaked_key_mint_one_successor() {
         let a = SigningKey::from_bytes(&[1u8; 32]);
@@ -1410,7 +972,6 @@ mod tests {
         let old = SigningKey::from_bytes(&[1u8; 32]);
         let new = SigningKey::from_bytes(&[2u8; 32]);
 
-        // A transition tampered after signing (new_pub swapped) fails to verify.
         let mut t = AuthorityKeyTransition::build(&old, &new);
         t.new_pubkey_hex = hex::encode(
             SigningKey::from_bytes(&[9u8; 32])
@@ -1419,7 +980,6 @@ mod tests {
         );
         assert!(t.verify().is_err());
 
-        // A directory signed by an unrelated key with no transition is rejected.
         let rogue = SigningKey::from_bytes(&[3u8; 32]);
         let r1 = fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1");
         let doc = DirectoryDoc::new(vec![r1], std::time::Duration::from_secs(86_400)).unwrap();
@@ -1460,7 +1020,6 @@ mod tests {
         let r1 = fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1");
         let doc = DirectoryDoc::new(vec![r1], std::time::Duration::from_secs(86_400)).unwrap();
         let mut signed = SignedDirectory::sign(doc, &signer).unwrap();
-        // Mutate the doc — should now fail verification.
         signed.doc.relays[0].addr = "9.9.9.9:443".to_string();
         assert!(matches!(signed.verify(&pubkey), Err(Error::Directory(_))));
     }
@@ -1476,19 +1035,12 @@ mod tests {
 
         let r1 = fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1");
         let mut doc = DirectoryDoc::new(vec![r1], std::time::Duration::from_secs(86_400)).unwrap();
-        // Force expiration into the past.
         doc.valid_after = 1_000_000;
         doc.valid_until = 1_001_000;
         let signed = SignedDirectory::sign(doc, &signer).unwrap();
         assert!(matches!(signed.verify(&pubkey), Err(Error::Directory(_))));
     }
 
-    /// Authenticity is not freshness. Inside the validity window EVERY document
-    /// the authority ever signed verifies equally, so a malicious host or
-    /// on-path attacker can replay an OLD one — e.g. from before a misbehaving
-    /// relay was removed, or with a smaller relay set that narrows path
-    /// selection toward relays they run. `valid_after` is inside the signed
-    /// bytes, so it cannot be forged forward and serves as a monotonic counter.
     #[test]
     fn a_replayed_older_directory_is_rejected_even_though_it_verifies() {
         use rand::RngCore;
@@ -1503,8 +1055,6 @@ mod tests {
             .unwrap()
             .as_secs();
 
-        // Two genuine documents, both currently valid; `newer` was published an
-        // hour after `older`. `older` names FEWER relays — the attacker's goal.
         let mk = |valid_after: u64, relays: Vec<RelayDescriptor>| {
             let mut doc =
                 DirectoryDoc::new(relays, std::time::Duration::from_secs(86_400)).unwrap();
@@ -1524,37 +1074,21 @@ mod tests {
             ],
         );
 
-        // Both are authentic — plain `verify` cannot tell them apart.
         assert!(older.verify(&pubkey).is_ok());
         assert!(newer.verify(&pubkey).is_ok());
 
-        // Accept the newer one, recording its high-water mark…
         let high = newer.verify_monotonic(&pubkey, 0).expect("newer accepted");
         assert_eq!(high, now - 3600);
 
-        // …after which replaying the older one is refused.
         assert!(
             older.verify_monotonic(&pubkey, high).is_err(),
             "an older-but-still-valid directory must be rejected as a rollback"
         );
-        // Re-serving the SAME document is fine (not a rollback) — clients
-        // refetch on a timer and must not lock themselves out.
         assert_eq!(
             newer.verify_monotonic(&pubkey, high).unwrap(),
             high,
             "the current document must remain acceptable"
         );
-        // F-63 — this line used to read `assert!(older.verify_monotonic(&pubkey,
-        // 0).is_ok())` under the comment "an expired document is still
-        // rejected". `older` is not expired (the closure gives both documents
-        // `valid_until = now + 86_400`), and the assertion asserted the
-        // opposite of its comment: it re-proved that a high-water of 0
-        // constrains nothing, which the line above already showed.
-        //
-        // What needs proving is the INTERACTION: the validity window is
-        // checked inside `verify`, and the monotonic path must not short-
-        // circuit it. That window is the only thing bounding how far back a
-        // replayed directory can reach, so a bug there is unbounded rollback.
         let mut stale = DirectoryDoc::new(
             vec![fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1")],
             std::time::Duration::from_secs(86_400),
@@ -1588,7 +1122,6 @@ mod tests {
 
         let r1 = fake_relay("a", RelayTier::Entry, [1, 2, 3, 4], "op1");
         let mut doc = DirectoryDoc::new(vec![r1], std::time::Duration::from_secs(86_400)).unwrap();
-        // Future validity window.
         let future = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1626,8 +1159,6 @@ mod tests {
         let mut r = rng();
         let entry = fake_relay("e", RelayTier::Entry, [1, 0, 0, 1], "opE");
         let mix = fake_relay("m", RelayTier::Mix, [2, 0, 0, 1], "opM");
-        // The forced exit is tagged MIX (e.g. a mailbox host that isn't an Exit)
-        // — pick_to_exit must still place it last, with its tier ignored.
         let host = fake_relay("h", RelayTier::Mix, [3, 0, 0, 1], "opH");
         let relays = vec![entry, mix, host.clone()];
         let path = PathSelector::new(&relays)
@@ -1660,25 +1191,17 @@ mod tests {
         ]
     }
 
-    // ─── RFC B3 rendezvous transport ───────────────────────────────────────
-
     #[test]
     fn rendezvous_hosted_relays_inherit_rendezvous_network_for_caps() {
-        // One rendezvous relay R and many CGNAT relays hosted behind it. Each
-        // hosted relay has no address of its own; RFC B3 makes it inherit R's
-        // network position, so they all compete for R's /24 budget instead of
-        // escaping the caps (which they would if their `None` address counted as
-        // "no network"). Without inheritance all 13 would be kept.
         let r = fake_relay("R", RelayTier::Mix, [10, 0, 0, 1], "opR");
         let r_id = r.id_pubkey_hex.clone();
         let mut set = vec![r];
         for i in 0..12u8 {
             let mut n = fake_relay(&format!("N{i}"), RelayTier::Mix, [172, 16, 0, i + 1], "opN");
-            n.addr = String::new(); // CGNAT: not directly dialable
+            n.addr = String::new();
             n.rendezvous = Some(r_id.clone());
             set.push(n);
         }
-        // All 13 resolve to R's 10.0.0.1 → same /24 → bounded by the /24 cap.
         assert_eq!(apply_diversity_caps(set).len(), MAX_RELAYS_PER_24);
     }
 
@@ -1691,7 +1214,6 @@ mod tests {
             fake_relay("g", RelayTier::Exit, [1, 1, 1, 1], "grace"),
             fake_relay("h", RelayTier::Exit, [8, 8, 8, 1], "henry"),
         ];
-        // A rendezvous-capable direct mix R and a CGNAT mix N hosted by it.
         let mut rr = fake_relay("R", RelayTier::Mix, [172, 16, 0, 1], "rr");
         rr.rendezvous_capable = true;
         let r_id = rr.id_pubkey_hex.clone();
@@ -1703,8 +1225,6 @@ mod tests {
         relays.push(n);
         let sel = PathSelector::new(&relays);
 
-        // Over many picks, N is sometimes the chosen middle hop; whenever it is,
-        // its rendezvous relay R must sit immediately before it (never as entry).
         let mut saw_hosted = false;
         for _ in 0..60 {
             let path = sel.pick(&mut r, 3).expect("pick");
@@ -1726,14 +1246,10 @@ mod tests {
 
     #[test]
     fn hosted_relay_with_absent_rendezvous_is_dropped_from_caps() {
-        // RFC B3 fail-closed: a CGNAT relay whose R is not in the set has no
-        // network position and must NOT be kept (it would otherwise escape the
-        // concentration caps entirely).
         let mut n = fake_relay("N", RelayTier::Mix, [0, 0, 0, 0], "nn");
         n.addr = String::new();
-        n.rendezvous = Some(
-            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(), // absent R
-        );
+        n.rendezvous =
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into());
         let direct = fake_relay("d", RelayTier::Mix, [203, 0, 113, 1], "dd");
         let kept = apply_diversity_caps(vec![n, direct]);
         assert_eq!(kept.len(), 1, "only the directly-reachable relay survives");
@@ -1780,8 +1296,6 @@ mod tests {
 
     #[test]
     fn pick_no_consecutive_same_operator() {
-        // Build a directory where it's impossible to pick a path without
-        // sharing operators only if we have enough variety.
         let mut r = rng();
         let relays = make_balanced_directory();
         let sel = PathSelector::new(&relays);
@@ -1800,28 +1314,19 @@ mod tests {
     fn network_diverse_covers_v4_16_and_v6_48() {
         use std::net::IpAddr;
         let p = |s: &str| s.parse::<IpAddr>().unwrap();
-        // IPv4 /16.
         assert!(!network_diverse(p("203.0.113.1"), p("203.0.200.9")));
         assert!(network_diverse(p("203.0.113.1"), p("198.51.100.1")));
-        // IPv6 /48 (first 6 bytes).
         assert!(!network_diverse(
             p("2001:db8:1::1"),
             p("2001:db8:1:ffff::9")
         ));
         assert!(network_diverse(p("2001:db8:1::1"), p("2001:db8:2::1")));
-        // Mixed families never collide.
         assert!(network_diverse(p("203.0.113.1"), p("2001:db8:1::1")));
-        // Loopback relaxation is test-only (both must be loopback).
         assert!(network_diverse(p("127.0.0.1"), p("127.0.0.2")));
     }
 
     #[test]
     fn pick_refuses_one_operator_at_both_ends() {
-        // A colluding operator runs BOTH an entry and an exit node (distinct
-        // keys, distinct /16 — so ONLY the operator rule can catch it). With no
-        // other exit available, a diverse path is impossible, and `pick` must
-        // FAIL rather than hand the same operator both the sender IP (entry) and
-        // the recipient IP (exit) — the single-operator correlation attack.
         let mut r = rng();
         let relays = vec![
             fake_relay("a", RelayTier::Entry, [10, 0, 0, 1], "colluder"),
@@ -1837,9 +1342,6 @@ mod tests {
 
     #[test]
     fn pick_entry_and_exit_always_distinct_operators() {
-        // With honest alternatives present, picks succeed, but the entry and
-        // exit operators must never coincide even though they are non-adjacent
-        // hops — and no operator may appear twice anywhere on the path.
         let mut r = rng();
         let mut relays = make_balanced_directory();
         relays.push(fake_relay("x", RelayTier::Entry, [5, 5, 0, 1], "colluder"));
@@ -1861,7 +1363,6 @@ mod tests {
     #[test]
     fn pick_fails_when_pool_too_small() {
         let mut r = rng();
-        // Only entries, no exits / mixes.
         let relays = vec![fake_relay("a", RelayTier::Entry, [10, 0, 0, 1], "alice")];
         let sel = PathSelector::new(&relays);
         assert!(sel.pick(&mut r, 3).is_err());
@@ -1896,18 +1397,9 @@ mod tests {
         );
     }
 
-    /// F-38 — the entry hop is PINNED, not re-drawn for every packet.
-    ///
-    /// A fresh uniform entry per packet guarantees eventual discovery rather
-    /// than preventing it: with ~8640 draws a day, meeting an adversary-run
-    /// entry stops being a question of whether and becomes one of when.
     #[test]
     fn entry_guards_pin_the_first_hop_and_degrade_gracefully() {
         let mut r = rng();
-        // `fake_relay` derives the identity from the FIRST BYTE of the name,
-        // so the names must differ in that byte or every relay shares one
-        // identity — which is how the first draft of this test "passed" the
-        // guard assertions for the wrong reason.
         let relays = vec![
             fake_relay("a", RelayTier::Entry, [1, 1, 1, 1], "op1"),
             fake_relay("b", RelayTier::Entry, [2, 2, 2, 2], "op2"),
@@ -1918,8 +1410,6 @@ mod tests {
         ];
         let guards = vec![relays[0].id_pubkey_hex.clone()];
 
-        // Every path starts at the guard, over enough draws that an unpinned
-        // selector would certainly have wandered.
         for _ in 0..64 {
             let path = PathSelector::new(&relays)
                 .with_guards(&guards)
@@ -1927,7 +1417,6 @@ mod tests {
                 .expect("a guarded path must still be selectable");
             assert_eq!(path.hops[0].id_pubkey_hex, relays[0].id_pubkey_hex);
         }
-        // …and the same holds when the exit is forced (the mailbox path).
         let exit = relays[5].clone();
         for _ in 0..32 {
             let path = PathSelector::new(&relays)
@@ -1937,25 +1426,18 @@ mod tests {
             assert_eq!(path.hops[0].id_pubkey_hex, relays[0].id_pubkey_hex);
         }
 
-        // An unpinned selector really does wander — otherwise the assertions
-        // above would pass for the wrong reason.
         let seen: std::collections::HashSet<String> = (0..64)
             .filter_map(|_| PathSelector::new(&relays).pick(&mut r, 3).ok())
             .map(|p| p.hops[0].id_pubkey_hex.clone())
             .collect();
         assert!(seen.len() > 1, "the unguarded selector must not be sticky");
 
-        // A guard that has LEFT the directory must not take the client
-        // offline: the pool falls back rather than failing closed. Failing
-        // closed here would turn one relay's retirement into an outage for
-        // everyone who happened to pin it.
         let gone = vec!["deadbeef".to_string()];
         assert!(PathSelector::new(&relays)
             .with_guards(&gone)
             .pick(&mut r, 3)
             .is_ok());
 
-        // An empty guard set is the pre-guard behaviour, unchanged.
         assert!(PathSelector::new(&relays)
             .with_guards(&[])
             .pick(&mut r, 3)

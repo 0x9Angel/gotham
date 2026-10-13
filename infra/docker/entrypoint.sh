@@ -1,9 +1,4 @@
 #!/bin/sh
-# Container entrypoint for the Gotham relay: generate the identity key on first
-# run, then exec the daemon with flags derived from environment variables.
-# GOTHAM_ENROLL_TOKEN is read directly from the env by the binary (so it never
-# appears in the process argv). If GOTHAM_ADVERTISE_ADDR is unset the relay
-# auto-maps its port via UPnP-IGD (needs host networking to reach the router).
 set -e
 
 KEY=/var/lib/gotham-relay/relay.key

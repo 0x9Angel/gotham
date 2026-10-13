@@ -1,74 +1,12 @@
 #!/usr/bin/env bash
-# install-relay.sh — one-command, AUTONOMOUS Gotham mixnet relay installer.
-#
-# For volunteer relay operators on ANY Ubuntu/Debian host — a public VPS, a home
-# box with a port-forward, OR a machine behind CGNAT / mobile 4G-5G / broken UPnP
-# (it auto-falls back to RFC B3 rendezvous mode, keeping an OUTBOUND tunnel to a
-# public rendezvous relay — no public IP or port-forward needed). No source
-# build: it downloads the prebuilt, checksum-verified relay binary and wires up
-# auto-enrollment so the relay joins the network on its own.
-#
-# USAGE (run as root) — no token needed, enrollment is open, but you MUST name
-# yourself so the network is allowed to route through you (see GOTHAM_OPERATOR):
-#   curl -fsSL https://raw.githubusercontent.com/0x9Angel/gotham-relay/main/infra/scripts/install-relay.sh | sudo GOTHAM_OPERATOR=your-name bash
-#
-# or, after cloning the repo:
-#   sudo GOTHAM_OPERATOR=your-name bash infra/scripts/install-relay.sh
-#
-# CONFIG (environment variables):
-#   GOTHAM_OPERATOR       REQUIRED. Public nickname identifying who runs this
-#                         relay. Path selection refuses two hops it cannot PROVE
-#                         belong to different operators, so an unlabelled relay
-#                         is never routed. Use the SAME value on every relay you
-#                         run, so diversity reflects who actually runs what.
-#   GOTHAM_ENROLL_TOKEN   Only if the authority runs in closed/token mode.
-#                         Enrollment is OPEN by default — you do NOT need one.
-#   GOTHAM_AUTHORITY_URL  Directory authority base URL.
-#                         Default: http://144.24.205.188:8443
-#   GOTHAM_EXTRA_AUTHORITY_URLS
-#                         Space-separated ADDITIONAL authorities to enroll with.
-#                         Clients need a quorum of attestations, so the default
-#                         is the other two authorities of the shipped set.
-#   GOTHAM_TIER           entry | mix | exit. Default: mix
-#                         (a middle hop sees neither sender nor recipient —
-#                          the safest role for a volunteer).
-#   GOTHAM_PORT           UDP listen + advertise port. Default: 443
-#   GOTHAM_ADVERTISE_IP   Public IP peers reach you on. Default: auto-detected.
-#                         Set this explicitly if you port-forward UDP behind NAT.
-#   GOTHAM_RENDEZVOUS     auto | on | off. Default auto: use a rendezvous point
-#                         (RFC B3) when no reachable public address is found —
-#                         this is what lets a 4G/5G / CGNAT box be a relay.
-#   GOTHAM_COUNTRY        ISO 3166-1 code to publish (e.g. FR). Optional.
-#
-# What it does:
-#   1. Installs minimal deps (curl, ufw, ca-certificates)
-#   2. Creates the `gotham` system user (no shell, no home)
-#   3. Downloads + sha256-verifies the latest `gotham-relay-linux-x86_64`
-#   4. Generates an X25519 identity key if one doesn't exist
-#   5. Writes the relay config + installs a hardened systemd unit
-#   6. Opens the firewall (SSH + your UDP port), starts the service
-#   7. Waits until enough authorities have attested the relay, and says so
-#      honestly when they have not
 
 set -euo pipefail
 
-# ─── Config + defaults ──────────────────────────────────────────────────
 AUTHORITY_URL="${GOTHAM_AUTHORITY_URL:-http://144.24.205.188:8443}"
-# Clients admit a relay only when k of n authorities have attested it (k=2,
-# n=3 in the shipped app). Enrolling with the primary alone produced a relay
-# that ran, reported itself healthy, and was DROPPED by every client — the
-# installer even printed "LIVE and ENROLLED". Enrol with all three.
 EXTRA_AUTHORITY_URLS="${GOTHAM_EXTRA_AUTHORITY_URLS:-http://84.235.232.196:8443 http://84.235.228.107:8443}"
 TIER="${GOTHAM_TIER:-mix}"
 PORT="${GOTHAM_PORT:-443}"
 COUNTRY="${GOTHAM_COUNTRY:-}"
-# Path selection refuses two hops it cannot PROVE belong to different
-# operators, so a relay with no label can never be part of a route. This used to
-# fall back to the hostname, which is worse than it looks: two relays run by the
-# same person get two different hostnames, so the network would treat them as
-# independent operators and could put both at the two ends of one path -- the
-# exact correlation the rule exists to prevent. Only the operator knows the
-# right value, so we ask for it and refuse to guess.
 OPERATOR="${GOTHAM_OPERATOR:-}"
 ENROLL_TOKEN="${GOTHAM_ENROLL_TOKEN:-}"
 
@@ -86,11 +24,8 @@ ENVFILE=/etc/gotham/relay.env
 LOG_DIR=/var/log/gotham
 RELAY_USER=gotham
 
-# ─── Sanity checks ──────────────────────────────────────────────────────
 [[ "$(id -u)" -eq 0 ]] || { echo "Run as root: sudo bash $0"; exit 1; }
 case "$TIER" in entry|mix|exit) ;; *) echo "[!] GOTHAM_TIER must be entry|mix|exit (got '$TIER')"; exit 1;; esac
-# Checked BEFORE anything is installed: a relay that cannot be routed is worse
-# than no relay, because nobody finds out. Better a clean refusal now.
 if [[ -z "$OPERATOR" ]]; then
     echo "[!] GOTHAM_OPERATOR is required and was not set."
     echo
@@ -106,9 +41,6 @@ if [[ -z "$OPERATOR" ]]; then
     echo "    your machines apart from everyone else's."
     exit 1
 fi
-# The label reaches the relay through systemd's word-splitting of
-# GOTHAM_EXTRA_ARGS, so a space or a quote in it would silently become a
-# separate argument and shift every flag after it.
 [[ "$OPERATOR" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || {
     echo "[!] GOTHAM_OPERATOR must be 1 to 32 characters from A-Z a-z 0-9 . _ -"
     echo "    (got '$OPERATOR')"
@@ -142,7 +74,6 @@ curl -fsSL "$base/$ASSET"        -o "$TMP/$ASSET"
 curl -fsSL "$base/$ASSET.sha256" -o "$TMP/$ASSET.sha256"
 ( cd "$TMP" && sha256sum -c "$ASSET.sha256" ) || { echo "[!] Checksum verification FAILED — refusing to install."; exit 1; }
 install -m 0755 -o root -g root "$TMP/$ASSET" "$BIN"
-# UDP ports < 1024 need CAP_NET_BIND_SERVICE since we run unprivileged.
 if [[ "$PORT" -lt 1024 ]]; then setcap 'cap_net_bind_service=+ep' "$BIN"; fi
 
 echo "[4/7] Generating relay identity (if absent)..."
@@ -156,37 +87,26 @@ ADVERTISE_IP="${GOTHAM_ADVERTISE_IP:-$(curl -fsSL --max-time 8 https://api.ipify
 EXTRA=""
 [[ -n "$COUNTRY"  ]] && EXTRA+=" --country $COUNTRY"
 EXTRA+=" --operator $OPERATOR"
-# One enrollment per authority; each one's PoP key is auto-fetched from its /pop.
 for u in $EXTRA_AUTHORITY_URLS; do
   EXTRA+=" --extra-authority-url $u"
 done
 
-# Decide DIRECT (we have a reachable public address) vs RENDEZVOUS (RFC B3 —
-# behind CGNAT / mobile 4G-5G / broken UPnP: keep an OUTBOUND tunnel to a public
-# rendezvous relay, no inbound reachability needed). GOTHAM_RENDEZVOUS=on|off|auto.
 MODE="direct"
 case "${GOTHAM_RENDEZVOUS:-auto}" in
   on|1|true)   MODE="rendezvous" ;;
   off|0|false) MODE="direct" ;;
-  *) # auto-detect
+  *)
     if [[ -n "${GOTHAM_ADVERTISE_IP:-}" ]]; then
-        MODE="direct"          # operator asserts a reachable address / port-forward
+        MODE="direct"
     elif [[ -n "$ADVERTISE_IP" ]] && { ip -o addr show 2>/dev/null || ifconfig 2>/dev/null; } | grep -qw "$ADVERTISE_IP"; then
-        MODE="direct"          # our public IP is bound to a local interface → directly reachable
+        MODE="direct"
     else
-        MODE="rendezvous"      # no public IP on this host and none asserted → behind NAT/CGNAT
+        MODE="rendezvous"
     fi ;;
 esac
 
-# Look up a rendezvous point and append the flags that use it. Factored out
-# because it is needed twice: once when we already know we are behind a NAT, and
-# once as the AUTOMATIC FALLBACK when a "directly reachable" relay turns out not
-# to be — which is the common case, and the one that used to require the project
-# owner to open a port on the volunteer's router by hand.
 pick_rendezvous() {
     DIR_JSON="$(curl -fsSL --max-time 10 "$AUTHORITY_URL/directory" || true)"
-    # The directory is compact JSON; split per-relay on '{' and match the flag,
-    # then pull its kem + addr.
     R_LINE="$(printf '%s' "$DIR_JSON" | tr '{' '\n' | grep '"rendezvous_capable":true' | head -1)"
     R_KEM="$(printf '%s'  "$R_LINE" | sed -n 's/.*"kem_pubkey_hex":"\([0-9a-fA-F]\{64\}\)".*/\1/p')"
     R_ADDR="$(printf '%s' "$R_LINE" | sed -n 's/.*"addr":"\([0-9.:]\{7,\}\)".*/\1/p')"
@@ -203,9 +123,6 @@ if [[ "$MODE" == "rendezvous" ]]; then
         exit 1
     fi
     echo "    Rendezvous relay: $R_ADDR"
-    # The relay auto-fetches the authority PoP key from /pop for the possession
-    # proof; nothing to paste. advertise-addr is IGNORED in rendezvous mode but
-    # must be non-empty (else systemd swallows the following flag) — placeholder.
     EXTRA+=" --rendezvous-key $R_KEM --rendezvous-addr $R_ADDR"
     ADVERTISE_ADDR="${ADVERTISE_IP:-127.0.0.1}:$PORT"
 else
@@ -214,7 +131,6 @@ else
     ADVERTISE_ADDR="$ADVERTISE_IP:$PORT"
 fi
 
-# relay.env holds the token — keep it readable only by root + the relay user.
 cat > "$ENVFILE" <<EOF
 GOTHAM_ENROLL_TOKEN=$ENROLL_TOKEN
 GOTHAM_AUTHORITY_URL=$AUTHORITY_URL
@@ -237,8 +153,6 @@ else
     curl -fsSL "https://raw.githubusercontent.com/$REPO/main/infra/systemd/crypto-gotham-relay.service" \
         -o /etc/systemd/system/crypto-gotham-relay.service
 fi
-# Rendezvous mode is OUTBOUND-only — no inbound port to open (that is the whole
-# point of B3). Only open the UDP port when we advertise a directly-reachable one.
 if [[ "$MODE" == "direct" ]]; then
     if command -v ufw &>/dev/null; then
         ufw allow 22/tcp comment 'SSH' >/dev/null 2>&1 || true
@@ -253,8 +167,6 @@ if [[ "$MODE" == "direct" ]]; then
 else
     echo "    Rendezvous mode: outbound-only, no inbound firewall rule needed."
 fi
-# Log rotation. Without it the relay appends forever and a flood of malformed
-# packets fills the disk, which stops the relay and often the whole VPS.
 LR_SRC=""
 for c in "$(dirname "$0")/../logrotate/gotham-relay" /tmp/crypto-src/infra/logrotate/gotham-relay; do
     [[ -f "$c" ]] && LR_SRC="$c" && break
@@ -271,17 +183,6 @@ systemctl daemon-reload
 systemctl enable --now crypto-gotham-relay.service
 
 echo "[7/7] Waiting for the authority to accept enrollment..."
-# Ask the AUTHORITY, not our own log. The directory is ground truth: either our
-# public key is in the signed document or it is not. Grepping the log used to
-# abort early on "does not host this relay" -- which is a NORMAL transient on a
-# rendezvous install, because the authority proves us live by querying our
-# rendezvous host and our reverse tunnel may not be registered there yet. Every
-# CGNAT volunteer was told the install had failed while it was in fact about to
-# succeed. The relay now retries that case within seconds; we just wait for it.
-# Count how many authorities list us. Clients admit a relay only when k of n
-# have attested it (k=2, n=3 today), so being in the primary's directory alone
-# means the relay runs, looks healthy, and is dropped by every client. The
-# installer used to print "LIVE and ENROLLED" for exactly that state.
 QUORUM_NEEDED="${GOTHAM_QUORUM_NEEDED:-2}"
 ALL_AUTHORITIES="$AUTHORITY_URL $EXTRA_AUTHORITY_URLS"
 
@@ -301,22 +202,12 @@ for _ in $(seq 1 20); do
     sleep 5
     SEEN_BY="$(count_attestations)"
     if [[ "$SEEN_BY" -ge "$QUORUM_NEEDED" ]]; then ENROLLED=1; break; fi
-    # Only a genuinely terminal failure aborts the wait.
     if grep -qi "invalid possession proof\|401 Unauthorized\|rejected: missing" "$LOG_DIR/relay.log" 2>/dev/null; then
         echo "    Authority refused this relay outright — see the cause below."
         break
     fi
 done
 
-# AUTOMATIC FALLBACK. A relay that believed it was directly reachable and was
-# not is the single most common failure, and the one that produced "phantom"
-# relays: the service runs, the volunteer sees no error, and the network ignores
-# them. The heuristic above cannot detect a provider-side firewall or a router
-# that silently drops inbound UDP — only the authority's dial-back can, and it
-# has just told us by NOT listing us.
-#
-# Rather than leave the volunteer to diagnose that, switch to the rendezvous
-# transport, which needs no inbound reachability at all, and try again.
 if [[ "$ENROLLED" -eq 0 && "$MODE" == "direct" && "${GOTHAM_RENDEZVOUS:-auto}" != "off" ]]; then
     echo
     echo "[!] No authority could reach UDP $PORT on $ADVERTISE_IP."

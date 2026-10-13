@@ -1,12 +1,3 @@
-# gotham-relay systemd unit
-#
-# Drop into /etc/systemd/system/gotham-relay.service and edit the User /
-# ExecStart paths to match the target host. Sandboxing flags assume
-# systemd ≥ 247.
-#
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable --now gotham-relay
-#   sudo journalctl -u gotham-relay -f
 
 [Unit]
 Description=Gotham mixnet relay
@@ -30,7 +21,6 @@ Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
 
-# ── Hardening (sandbox the process) ───────────────────────────────────────
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

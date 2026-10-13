@@ -1,18 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial
 // Copyright (C) 2026 0x9Angel.
 
-//! Stateless packet processor.
-//!
-//! [`Relay::process`] takes a 2048 B packet and returns one of:
-//!
-//! - [`ProcessOutcome::Drop`] — silently discard (replay, bad MAC, malformed)
-//! - [`ProcessOutcome::Forward`] — forward to the next hop after a Poisson delay
-//! - [`ProcessOutcome::DeliverLocal`] — this hop is the recipient
-//!
-//! No I/O is performed here — the caller (the transport layer in
-//! `main.rs`) is responsible for actually sending the bytes. This keeps
-//! the relay testable without spinning up sockets.
-
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
@@ -27,70 +15,37 @@ use crate::delay::PoissonScheduler;
 use crate::rate_limit::RateLimiter;
 use crate::replay::{ReplayCache, ReplayCheck};
 
-/// Reason a packet was dropped. Used for *counter* metrics only — the
-/// relay never logs per-packet identifiers or peer IPs.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum DropReason {
-    /// Header MAC failed verification.
     BadMac,
-    /// Packet's γ was already seen within the TTL window.
     Replay,
-    /// Header could not be parsed (version, hop_count, etc).
     Malformed,
-    /// Policy denied the route (e.g. self-loop, unknown next hop).
     PolicyDenied,
-    /// Operator-configured rate limit (packets/sec or daily byte quota)
-    /// was exceeded — the packet is shed to protect the volunteer's
-    /// machine and connection.
     RateLimited,
 }
 
-/// Outcome of processing a single packet.
 pub enum ProcessOutcome {
-    /// Silently drop the packet.
     Drop(DropReason),
-    /// Forward to the next hop after `delay`.
     Forward {
-        /// Destination socket of the next hop. A zero sentinel (`0.0.0.0:0`)
-        /// when `via_rendezvous` is set — the next hop is addressed by identity.
         next_addr: SocketAddrV4,
-        /// Identity fingerprint (X25519 pubkey) of the next hop.
         next_node_id: [u8; 32],
-        /// Poisson-sampled hold time before transmission.
         delay: Duration,
-        /// RFC B3: the next hop is a CGNAT relay reachable only via THIS relay's
-        /// rendezvous tunnel — push the packet down that tunnel (keyed by
-        /// `next_node_id`) instead of dialing `next_addr`.
         via_rendezvous: bool,
-        /// The full 2048 B packet to forward.
         packet: Box<[u8]>,
     },
-    /// Local delivery — this hop is the final recipient.
     DeliverLocal {
-        /// Poisson-sampled hold time before processing.
         delay: Duration,
-        /// The packet's payload (header stripped).
         payload: Box<[u8]>,
     },
 }
 
 impl ProcessOutcome {
-    /// Convenience: did the packet get dropped?
     #[must_use]
     pub fn is_drop(&self) -> bool {
         matches!(self, ProcessOutcome::Drop(_))
     }
 }
 
-/// A Gotham relay's runtime state.
-///
-/// Holds:
-/// - the relay's long-term X25519 identity secret key
-/// - the replay cache
-/// - the Poisson delay scheduler
-///
-/// `&mut self` is required for `process` because the replay cache is
-/// updated on every fresh packet.
 #[derive(ZeroizeOnDrop)]
 pub struct Relay {
     #[zeroize(skip)]
@@ -99,38 +54,16 @@ pub struct Relay {
     scheduler: PoissonScheduler,
     #[zeroize(skip)]
     rate_limiter: RateLimiter,
-    /// F-01 — accept headers still using the v2 MAC construction.
-    ///
-    /// v2 authenticates one slot of the routing block, which IS the tagging
-    /// channel: an entry relay marks the exit's slot, a colluding exit reads
-    /// it back, and the packet routes correctly. Accepting v2 keeps clients
-    /// that have not updated working, at the cost of leaving that channel open
-    /// for them. It defaults to ON so a relay upgrade does not cut off the
-    /// installed base, and the relay says loudly that it is on — turn it off
-    /// with `--strict-header-v3` once clients have moved.
     #[zeroize(skip)]
     accept_header_v2: bool,
-    /// How many v2 packets this relay has accepted. Logged once at the first
-    /// one and periodically after, so "the window is still open" is visible
-    /// rather than inferred.
     #[zeroize(skip)]
     v2_accepted: u64,
-    /// F-25 — where the replay cache is kept across restarts.
-    ///
-    /// `None` keeps the old behaviour: the cache is RAM-only and a restart
-    /// forgets every γ this relay has seen, reopening the replay window to its
-    /// full width. An attacker does not need to cause the restart — upgrades,
-    /// reboots and crashes provide them.
     #[zeroize(skip)]
     replay_path: Option<std::path::PathBuf>,
     identity_sk: [u8; 32],
 }
 
 impl Relay {
-    /// Construct a relay from an existing X25519 secret key.
-    ///
-    /// `mean_delay_micros = 0` disables the Poisson scheduler (useful in
-    /// tests and benchmarks).
     #[must_use]
     pub fn new(
         identity_sk: [u8; 32],
@@ -149,11 +82,6 @@ impl Relay {
         }
     }
 
-    /// Keep the replay cache on disk at `path`, loading it now (F-25).
-    ///
-    /// Loading happens here rather than lazily so a corrupt or unreadable
-    /// snapshot is reported at start-up, when an operator is watching, instead
-    /// of silently leaving the relay with an empty cache it believes is warm.
     #[must_use]
     pub fn with_replay_persistence(mut self, path: std::path::PathBuf) -> Self {
         match crate::replay::persist::load(&mut self.replay_cache, &path) {
@@ -169,77 +97,48 @@ impl Relay {
         self
     }
 
-    /// Encode the replay cache for persistence, with its destination path.
-    ///
-    /// In-memory only, so it is cheap enough to run under the relay lock on
-    /// the packet path. The caller writes the bytes OUTSIDE the lock — a full
-    /// cache is ~24 MB plus an fsync, and the first version held the lock
-    /// through all of it, stalling forwarding for ~100 ms every minute while
-    /// its own comment said the opposite.
     pub fn encode_replay(&self) -> Option<(Vec<u8>, std::path::PathBuf)> {
         let path = self.replay_path.clone()?;
         Some((crate::replay::persist::encode(&self.replay_cache), path))
     }
 
-    /// Write the replay cache to its configured path, synchronously.
-    ///
-    /// For the final save at shutdown, where blocking until the bytes are on
-    /// disk is the point. The periodic task uses `encode_replay` instead.
     pub fn persist_replay(&self) -> Option<std::io::Result<usize>> {
         let path = self.replay_path.as_ref()?;
         Some(crate::replay::persist::save(&self.replay_cache, path))
     }
 
-    /// `true` if this relay keeps its replay cache across restarts.
     #[must_use]
     pub fn persists_replay(&self) -> bool {
         self.replay_path.is_some()
     }
 
-    /// Refuse headers built with the v2 MAC construction (F-01).
-    ///
-    /// Flip this once the clients a relay serves have updated. Until then the
-    /// tagging channel is open for every v2 packet it carries — which is why
-    /// the relay logs the count rather than letting the window be forgotten.
     #[must_use]
     pub fn strict_header_v3(mut self) -> Self {
         self.accept_header_v2 = false;
         self
     }
 
-    /// Attach an inbound rate limiter (packets/sec ceiling + rolling daily
-    /// wire-byte quota). Either bound may be `0` to disable it; the default
-    /// from [`Relay::new`] is fully unlimited. Returns `self` for chaining.
-    ///
-    /// This is how a volunteer caps the load a relay can place on their
-    /// machine and connection — see `docs/gotham/README.md`.
     #[must_use]
     pub fn with_rate_limit(mut self, max_pps: f64, max_bytes_per_day: u64) -> Self {
         self.rate_limiter = RateLimiter::new(max_pps, max_bytes_per_day);
         self
     }
 
-    /// Read-only access to the configured scheduler.
     #[must_use]
     pub fn scheduler(&self) -> &PoissonScheduler {
         &self.scheduler
     }
 
-    /// Current size of the replay cache (for metrics).
     #[must_use]
     pub fn replay_cache_len(&self) -> usize {
         self.replay_cache.len()
     }
 
-    /// Derive the X25519 public key matching this relay's identity.
     #[must_use]
     pub fn identity_public_key(&self) -> [u8; 32] {
         x25519_dalek::PublicKey::from(&StaticSecret::from(self.identity_sk)).to_bytes()
     }
 
-    /// Process one inbound packet.
-    ///
-    /// `packet_bytes.len()` must equal [`crypto_gotham::PACKET_SIZE`] (2048).
     pub fn process<R: CryptoRng + RngCore>(
         &mut self,
         rng: &mut R,
@@ -249,15 +148,11 @@ impl Relay {
             return ProcessOutcome::Drop(DropReason::Malformed);
         }
 
-        // ── 0. Rate limit (cheapest possible flood shedding) ──────────────
-        // Checked before any X25519/Sphinx work so a flood costs the
-        // operator only a token-bucket comparison, never crypto CPU.
         if !self.rate_limiter.check(packet_bytes.len()).is_allowed() {
             debug!("dropped: rate limited");
             return ProcessOutcome::Drop(DropReason::RateLimited);
         }
 
-        // ── 1. Parse header ───────────────────────────────────────────────
         let header_arr: &[u8; HEADER_LEN] = match packet_bytes[..HEADER_LEN].try_into() {
             Ok(a) => a,
             Err(_) => return ProcessOutcome::Drop(DropReason::Malformed),
@@ -267,13 +162,6 @@ impl Relay {
             Err(_) => return ProcessOutcome::Drop(DropReason::Malformed),
         };
 
-        // ── 1b. Header version policy (F-01) ──────────────────────────────
-        //
-        // `decode` parses v2 so this decision can be taken here rather than
-        // buried in a parser. A v2 header's MAC covers one slot of the routing
-        // block, which is the tagging channel; accepting it is a deliberate
-        // compatibility choice with a real cost, so it is counted and said out
-        // loud rather than being silently permanent.
         if header.version == crypto_gotham::header::VERSION_LEGACY {
             if !self.accept_header_v2 {
                 debug!("dropped: legacy v2 header refused (strict mode)");
@@ -289,24 +177,12 @@ impl Relay {
             }
         }
 
-        // ── 2. Derive per-hop sub-keys (X25519 DH) ────────────────────────
         let shared = x25519(self.identity_sk, header.alpha);
         let sub_keys = match derive_hop_subkeys(&shared) {
             Ok(s) => s,
             Err(_) => return ProcessOutcome::Drop(DropReason::Malformed),
         };
 
-        // ── 3. Unwrap FIRST (verifies MAC + decrypts this hop's slot) ─────
-        //
-        // Authenticate before touching any shared state. γ is the header MAC,
-        // and it travels in the clear: anyone who can OBSERVE a packet in flight
-        // can copy its γ. If the replay cache were populated before this check,
-        // that observer could race a forged packet carrying the stolen γ to the
-        // next hop — the forgery would poison the cache, and the genuine packet
-        // arriving moments later would be dropped as a "replay". That is
-        // targeted, deniable message suppression at zero cost. Inserting only
-        // AFTER the MAC verifies means an attacker must already possess a valid
-        // packet to occupy a cache slot.
         let outcome = match unwrap_header(&header, &sub_keys) {
             Ok(o) => o,
             Err(GothamError::BadMac) => {
@@ -319,46 +195,20 @@ impl Relay {
             }
         };
 
-        // ── 4. Replay check using γ as the unique tag ─────────────────────
         if self.replay_cache.check_and_insert(header.gamma) == ReplayCheck::Replay {
             debug!("dropped: replay");
             return ProcessOutcome::Drop(DropReason::Replay);
         }
 
-        // ── 5. Mix delay ──────────────────────────────────────────────────
-        // Honor the sender-chosen per-hop delay (Loopix sender-chosen delays:
-        // the sender samples each hold from Exp(λ) and encodes it). A `0`
-        // record leaves it unset — fall back to this relay's own Poisson
-        // scheduler (cover traffic, or legacy/0-mean senders).
-        // Hard ceiling on the sender-chosen per-hop hold. `delay_micros` rides in
-        // the peeled routing record and is fully attacker-controlled; a u32
-        // permits ~71 min, long enough that a flood of max-delay packets pins a
-        // large number of sleeping forward tasks — each retaining its 2 KB
-        // packet — as a memory-amplification DoS. Real Loopix hops sample
-        // sub-second holds, so a few-second ceiling preserves legitimate mixing
-        // while bounding retained memory to (max_pps × MAX_HOP_DELAY × PACKET).
         const MAX_HOP_DELAY: Duration = Duration::from_secs(30);
         let delay = match outcome.record.delay_micros {
             0 => self.scheduler.next_delay(rng),
             micros => Duration::from_micros(u64::from(micros)).min(MAX_HOP_DELAY),
         };
 
-        // ── 6. Peel THIS hop's payload onion layer (LIONESS) ──────────────
-        // The payload region carries one LIONESS layer per hop (applied by the
-        // sender). Decrypting our layer both reveals the original bytes for the
-        // exit AND — on a forwarded packet — transforms what the next link
-        // carries, so the payload cannot be byte-matched across two points of
-        // the path. Content stays end-to-end encrypted.
-        //
-        // This comment used to claim the stronger "no operator can byte-match
-        // the same flow across two points of the path", which was false while
-        // it was written: the payload was hardened, but the HEADER forwarded β
-        // and the trailer verbatim, leaving 332 constant bytes to match on.
-        // Unlinkability needs BOTH halves — see header.rs, wire version 2.
         let mut payload_region = packet_bytes[HEADER_LEN..].to_vec();
         crypto_gotham::lioness::decrypt(&sub_keys.k_payload, &mut payload_region);
 
-        // ── 7. Forward vs deliver decision ────────────────────────────────
         if outcome.record.is_last_hop() {
             trace!(?delay, "deliver-local");
             return ProcessOutcome::DeliverLocal {
@@ -367,7 +217,6 @@ impl Relay {
             };
         }
 
-        // Construct the outgoing packet: new header || peeled payload.
         let next_header_bytes = outcome.next_header.encode();
         let mut next_packet = vec![0u8; crypto_gotham::PACKET_SIZE].into_boxed_slice();
         next_packet[..HEADER_LEN].copy_from_slice(&next_header_bytes);
@@ -378,16 +227,14 @@ impl Relay {
             outcome.record.next_port,
         );
 
-        // Sanity policy: refuse self-loops.
         let our_pk = self.identity_public_key();
         if outcome.record.next_node_id == our_pk {
             debug!("dropped: self-loop");
             return ProcessOutcome::Drop(DropReason::PolicyDenied);
         }
 
-        // Anonymity hard-rule: never log routing fields (next port/addr).
         trace!(?delay, "forward");
-        let _ = RECORD_LEN; // silence unused-import warning when not in test
+        let _ = RECORD_LEN;
         ProcessOutcome::Forward {
             next_addr,
             next_node_id: outcome.record.next_node_id,
@@ -413,7 +260,6 @@ mod tests {
         ChaCha20Rng::seed_from_u64(0xFEED_FACE)
     }
 
-    /// Build a Gotham packet through `n` relays.
     fn build_packet_for_relays(
         rng: &mut ChaCha20Rng,
         relay_sks: &[[u8; 32]],
@@ -431,7 +277,7 @@ mod tests {
                 next_node_id: if i + 1 < n {
                     PublicKey::from(&StaticSecret::from(relay_sks[i + 1])).to_bytes()
                 } else {
-                    [0xEE; 32] // last hop has dummy next_node_id
+                    [0xEE; 32]
                 },
                 next_gamma: [0; 16],
                 delay_micros: 0,
@@ -445,20 +291,15 @@ mod tests {
             wrap_header(rng, mode::BALANCED, &alphas, &sub_keys, &records, trailer).unwrap();
         let mut packet = vec![0u8; crypto_gotham::PACKET_SIZE];
         packet[..HEADER_LEN].copy_from_slice(&header.encode());
-        // Fill payload with some bytes (would normally be sealed-sender + AEAD).
         for (i, byte) in packet[HEADER_LEN..].iter_mut().enumerate() {
             *byte = (i % 256) as u8;
         }
-        // Apply the sender-side LIONESS onion (innermost hop first) so the
-        // relays peel back to the original fill — mirrors `ship_path`.
         for sub in sub_keys.iter().rev() {
             crypto_gotham::lioness::encrypt(&sub.k_payload, &mut packet[HEADER_LEN..]);
         }
         (packet, pks)
     }
 
-    /// The deterministic payload the helper fills before onion-wrapping — what
-    /// the exit hop must recover after peeling every layer.
     fn expected_payload() -> Vec<u8> {
         (0..crypto_gotham::PACKET_SIZE - HEADER_LEN)
             .map(|i| (i % 256) as u8)
@@ -468,11 +309,9 @@ mod tests {
     #[test]
     fn forwards_a_packet_through_three_hops() {
         let mut rng = rng();
-        // Three relays.
         let sks: Vec<[u8; 32]> = (0..3).map(|i| [i as u8 + 1; 32]).collect();
         let (mut packet, _pks) = build_packet_for_relays(&mut rng, &sks);
 
-        // Hop 0
         let mut relay0 = Relay::new(sks[0], 1000, Duration::from_secs(60), 0);
         let r0 = relay0.process(&mut rng, &packet);
         let next0 = match r0 {
@@ -481,7 +320,6 @@ mod tests {
         };
         packet = next0.into_vec();
 
-        // Hop 1
         let mut relay1 = Relay::new(sks[1], 1000, Duration::from_secs(60), 0);
         let r1 = relay1.process(&mut rng, &packet);
         let next1 = match r1 {
@@ -490,14 +328,11 @@ mod tests {
         };
         packet = next1.into_vec();
 
-        // Hop 2 (last)
         let mut relay2 = Relay::new(sks[2], 1000, Duration::from_secs(60), 0);
         let r2 = relay2.process(&mut rng, &packet);
         match r2 {
             ProcessOutcome::DeliverLocal { payload, .. } => {
                 assert_eq!(payload.len(), crypto_gotham::PACKET_SIZE - HEADER_LEN);
-                // After peeling all three onion layers the exit must recover
-                // exactly the bytes the sender wrapped.
                 assert_eq!(
                     payload.into_vec(),
                     expected_payload(),
@@ -513,8 +348,6 @@ mod tests {
 
     #[test]
     fn rendezvous_flag_yields_via_rendezvous_forward() {
-        // RFC B3: a middle relay R whose peeled record carries VIA_RENDEZVOUS
-        // must be told to PUSH by identity (never dial the sentinel address).
         let mut rng = rng();
         let sks: Vec<[u8; 32]> = (0..2).map(|i| [i as u8 + 40; 32]).collect();
         let pks: Vec<[u8; 32]> = sks
@@ -524,9 +357,9 @@ mod tests {
         let (alphas, sub_keys) = derive_route_secrets(&mut rng, &pks).unwrap();
         let records = vec![
             RoutingRecord {
-                next_ipv4: [0, 0, 0, 0], // sentinel — must NOT be dialed
+                next_ipv4: [0, 0, 0, 0],
                 next_port: 0,
-                next_node_id: pks[1], // N addressed by identity
+                next_node_id: pks[1],
                 next_gamma: [0; 16],
                 delay_micros: 0,
                 flag: flag::VIA_RENDEZVOUS,
@@ -604,9 +437,6 @@ mod tests {
 
     #[test]
     fn payload_bytes_differ_at_every_hop() {
-        // The anti-correlation property: the same flow's payload region must
-        // look different on every link, so an operator on two hops can't
-        // byte-match. Only the exit ever sees the cleartext payload.
         let mut rng = rng();
         let sks: Vec<[u8; 32]> = (0..3).map(|i| [i as u8 + 1; 32]).collect();
         let (packet, _pks) = build_packet_for_relays(&mut rng, &sks);
@@ -626,11 +456,9 @@ mod tests {
         };
         let on_wire_pre_exit = p2[HEADER_LEN..].to_vec();
 
-        // Every link carries a distinct masking of the payload.
         assert_ne!(on_wire_entry, on_wire_mid);
         assert_ne!(on_wire_mid, on_wire_pre_exit);
         assert_ne!(on_wire_entry, on_wire_pre_exit);
-        // And none of the in-transit forms equals the cleartext the exit sees.
         assert_ne!(on_wire_entry, expected_payload());
         assert_ne!(on_wire_pre_exit, expected_payload());
 
@@ -657,25 +485,13 @@ mod tests {
         assert!(matches!(r2, ProcessOutcome::Drop(DropReason::Replay)));
     }
 
-    /// A forged packet must NOT occupy a replay-cache slot.
-    ///
-    /// γ is the header MAC and travels in the clear, so a network observer can
-    /// copy it from a packet in flight. If the cache were populated before the
-    /// MAC check, that observer could race a forgery carrying the stolen γ to
-    /// the next hop, poisoning the cache so the GENUINE packet is then dropped
-    /// as a "replay" — targeted, deniable message suppression at zero cost.
     #[test]
     fn a_forged_packet_cannot_poison_the_replay_cache() {
         let mut rng = rng();
         let sks: Vec<[u8; 32]> = (0..2).map(|i| [(i + 1) as u8; 32]).collect();
         let (packet, _) = build_packet_for_relays(&mut rng, &sks);
 
-        // The attacker copies the real packet and corrupts it so the MAC fails,
-        // keeping γ intact — exactly what an on-path observer can build.
         let mut forged = packet.clone();
-        // Corrupt THIS hop's routing record — β slot 0 lives at 36..100, and γ
-        // authenticates `meta || α || β[slot_i] || trailer`, so this breaks the
-        // MAC while γ itself (356..372) stays bit-for-bit the real one.
         forged[50] ^= 0xff;
 
         let mut relay = Relay::new(sks[0], 1000, Duration::from_secs(60), 0);
@@ -687,7 +503,6 @@ mod tests {
             "a packet that failed authentication must not consume a cache slot",
         );
 
-        // The genuine packet, arriving afterwards, must still be delivered.
         let good = relay.process(&mut rng, &packet);
         assert!(
             !good.is_drop(),
@@ -711,7 +526,6 @@ mod tests {
         let mut rng = rng();
         let sks: Vec<[u8; 32]> = (0..2).map(|i| [(i + 1) as u8; 32]).collect();
         let (mut packet, _) = build_packet_for_relays(&mut rng, &sks);
-        // Flip a bit inside γ (offset 356..372 of header).
         packet[360] ^= 0x02;
         let mut relay = Relay::new(sks[0], 100, Duration::from_secs(60), 0);
         assert!(matches!(
@@ -737,9 +551,6 @@ mod tests {
         let sks: Vec<[u8; 32]> = (0..2).map(|i| [(i + 1) as u8; 32]).collect();
         let (packet, _) = build_packet_for_relays(&mut rng, &sks);
 
-        // Tight cap: 5 pps ⇒ burst 10. A 200-packet flood fired in a tight
-        // loop (wall clock barely advances → negligible refill) must shed
-        // the overflow as RateLimited.
         let mut relay =
             Relay::new(sks[0], 100_000, Duration::from_secs(60), 0).with_rate_limit(5.0, 0);
         let mut rate_limited = 0usize;
@@ -762,7 +573,6 @@ mod tests {
         let mut rng = rng();
         let sks: Vec<[u8; 32]> = (0..2).map(|i| [(i + 1) as u8; 32]).collect();
         let (packet, _) = build_packet_for_relays(&mut rng, &sks);
-        // Default relay (no with_rate_limit) must behave exactly as before.
         let mut relay = Relay::new(sks[0], 100_000, Duration::from_secs(60), 0);
         for _ in 0..500 {
             assert!(!matches!(

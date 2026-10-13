@@ -1,35 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial
 // Copyright (C) 2026 0x9Angel.
 
-//! Single-Use Reply Blocks (SURBs) — anonymous replies through the mixnet.
-//!
-//! ## Why
-//!
-//! Store-and-forward mailbox *fetch* is the one metadata leak the deposit path
-//! already closed cannot: to receive a reply, the recipient normally connects
-//! directly to its mailbox host, so the host learns `recipient-IP ↔ mailbox_id`.
-//! A **SURB** removes that link. The recipient pre-builds a Sphinx header that
-//! routes a reply *from an entry relay back to itself* through the mixnet, hands
-//! that opaque block to the host inside a mixnet-delivered fetch request, and
-//! the host ships the stored messages back **through the mixnet** using it. The
-//! host never learns the recipient's address; only the recipient's own return
-//! guard sees its IP (the Tor model), and it can't see the `mailbox_id`.
-//!
-//! ## Shape
-//!
-//! [`Surb`] is the public, serialisable block the recipient gives away: the
-//! first-hop header + where to inject it + a `reply_key`. [`SurbKeys`] is the
-//! secret the recipient keeps to recover the reply.
-//!
-//! ## Payload handling
-//!
-//! Relays *decrypt* one LIONESS layer per hop as they forward (see
-//! [`crate::process`]). A SURB user never applied those layers, so the reply is
-//! progressively transformed on the way back; the recipient — who knows every
-//! hop's `k_payload` — re-applies them to recover it. The reply is additionally
-//! wrapped under `reply_key` so the *return-path* relays (which never see the
-//! SURB) only ever handle ciphertext, never the reply structure.
-
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use crypto_gotham::directory::SelectedPath;
@@ -44,68 +15,46 @@ use zeroize::ZeroizeOnDrop;
 use crate::client::MAX_PAYLOAD_SIZE;
 use crate::transport::{forward_packet, TransportError};
 
-/// Errors from building or using a SURB.
 #[derive(Debug, thiserror::Error)]
 pub enum SurbError {
-    /// `hop_count` outside the supported 2..=MAX_HOPS range (need ≥1 relay + self).
     #[error("surb hop_count must be in 2..={MAX_HOPS}")]
     BadHopCount,
-    /// A directory descriptor was malformed (addr / port / kem key).
     #[error("surb directory field malformed")]
     BadDirectory,
-    /// Sphinx header construction failed.
     #[error("surb header build failed")]
     Header,
-    /// The reply doesn't fit one packet.
     #[error("surb reply exceeds one packet")]
     ReplyTooLarge,
-    /// The recovered reply framing was invalid.
     #[error("surb reply framing invalid")]
     BadReply,
-    /// Underlying QUIC + Noise transport error while shipping a reply.
     #[error("surb transport: {0}")]
     Transport(#[from] TransportError),
 }
 
-/// The public reply block. Serialisable so it can ride inside a mailbox
-/// request; carries nothing that identifies the recipient.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Surb {
-    /// 384 B encoded first-hop [`Header`].
     header: Vec<u8>,
-    /// First hop's IPv4 octets + port — where a user injects the reply.
     first_hop_ipv4: [u8; 4],
     first_hop_port: u16,
-    /// First hop's node id (its X25519 pubkey) for the Noise XK handshake.
     first_hop_node_id: [u8; 32],
-    /// Wraps the reply so return-path relays only see ciphertext.
     reply_key: [u8; 32],
 }
 
-/// The recipient's secret needed to recover a reply sent via a [`Surb`].
 #[derive(Clone, ZeroizeOnDrop)]
 pub struct SurbKeys {
-    /// Per-hop `k_payload`, in path order (hop 0 … self). Re-applied in reverse
-    /// to undo the relays' forward-path decryptions.
     payload_keys: Vec<[u8; 32]>,
-    /// Same key stored in the [`Surb`]; unwraps the outer reply layer.
     reply_key: [u8; 32],
 }
 
-/// One per-hop delay for a reply path, drawn exactly as a forward packet's is.
 fn reply_hop_delay_micros<R: RngCore + ?Sized>(
     mode: crypto_gotham::cover::CoverMode,
     rng: &mut R,
 ) -> u32 {
     let sched = crate::delay::PoissonScheduler::new(mode.mean_hop_delay_micros());
     let micros = sched.next_delay(rng).as_micros().min(u32::MAX as u128) as u32;
-    // `0` stays reserved for "unset". Never emitted here — that is the point.
     micros.max(1)
 }
 
-/// Build a SURB for a return path whose **last hop is the recipient's own
-/// node** (`path.hops.last()` must be the recipient). Returns the public block
-/// to give away and the secret keys to keep.
 pub fn build_surb<R: CryptoRng + RngCore>(
     rng: &mut R,
     path: &SelectedPath<'_>,
@@ -113,21 +62,6 @@ pub fn build_surb<R: CryptoRng + RngCore>(
     build_surb_with_delay(rng, path, crypto_gotham::cover::CoverMode::Balanced)
 }
 
-/// As [`build_surb`], with the anonymity mode whose delay law the return path
-/// should follow.
-///
-/// F-30 — the reply path used to write `delay_micros = 0` in every record and
-/// let each relay fall back to its own scheduler. That value is a *sentinel*: a
-/// forward packet never carries it, because `sender_hop_delay_micros` clamps to
-/// `.max(1)`. So every hop of every SURB reply was flagged, on the wire, as
-/// "this is a reply" — a free, deterministic distinguisher between the two
-/// directions of a conversation, which is most of what a mixnet exists to hide.
-/// The reply path also inherited the relay's own `--delay-micros`, defaulting to
-/// the 20 ms this project had already documented as below path jitter and
-/// therefore worthless.
-///
-/// Sampling here, from the same Exp(λ) with the same λ as the user's forward
-/// traffic, makes the field statistically identical in both directions.
 pub fn build_surb_with_delay<R: CryptoRng + RngCore>(
     rng: &mut R,
     path: &SelectedPath<'_>,
@@ -147,7 +81,6 @@ pub fn build_surb_with_delay<R: CryptoRng + RngCore>(
     let (alphas, sub_keys) =
         derive_route_secrets(rng, &recipient_pks).map_err(|_| SurbError::Header)?;
 
-    // Routing records: record[i] points hop i to hop i+1; the last is final.
     let mut records: Vec<RoutingRecord> = Vec::with_capacity(n);
     for i in 0..n {
         let mut rec = RoutingRecord::default();
@@ -161,7 +94,6 @@ pub fn build_surb_with_delay<R: CryptoRng + RngCore>(
         } else {
             rec.flag = flag::IS_LAST_HOP;
         }
-        // F-30 — same law, same λ, same `.max(1)` clamp as a forward packet.
         rec.delay_micros = reply_hop_delay_micros(mode, rng);
         records.push(rec);
     }
@@ -192,17 +124,14 @@ pub fn build_surb_with_delay<R: CryptoRng + RngCore>(
 }
 
 impl Surb {
-    /// Serialize to MessagePack for carrying inside a request.
     pub fn to_bytes(&self) -> Option<Vec<u8>> {
         rmp_serde::to_vec_named(self).ok()
     }
 
-    /// Parse from MessagePack bytes.
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
         rmp_serde::from_slice(b).ok()
     }
 
-    /// Where a user must inject the reply packet.
     pub fn first_hop(&self) -> (SocketAddrV4, [u8; 32]) {
         (
             SocketAddrV4::new(Ipv4Addr::from(self.first_hop_ipv4), self.first_hop_port),
@@ -210,11 +139,6 @@ impl Surb {
         )
     }
 
-    /// Assemble the 2048 B reply packet for `reply`: the SURB header followed by
-    /// the reply, length-framed and wrapped under `reply_key` so return-path
-    /// relays see only ciphertext. Returns the packet to ship to [`first_hop`].
-    ///
-    /// [`first_hop`]: Surb::first_hop
     pub fn seal_reply(&self, reply: &[u8]) -> Result<Vec<u8>, SurbError> {
         if self.header.len() != HEADER_LEN {
             return Err(SurbError::Header);
@@ -225,7 +149,6 @@ impl Surb {
         let mut region = vec![0u8; PACKET_SIZE - HEADER_LEN];
         region[0..4].copy_from_slice(&(reply.len() as u32).to_be_bytes());
         region[4..4 + reply.len()].copy_from_slice(reply);
-        // Wrap so intermediate return hops never see the reply structure.
         lioness::encrypt(&self.reply_key, &mut region);
 
         let mut packet = vec![0u8; PACKET_SIZE];
@@ -236,23 +159,14 @@ impl Surb {
 }
 
 impl SurbKeys {
-    /// Recover the reply from the payload region delivered locally to the
-    /// recipient's own node (i.e. what its delivery handler receives). Undoes
-    /// every hop's forward-path LIONESS decryption, then the `reply_key` wrap.
-    /// Returns `None` if the recovered framing is invalid — the caller uses that
-    /// to tell "this local delivery was NOT a reply to this SURB" (trial-match
-    /// across outstanding SURBs).
     pub fn open(&self, delivered_region: &[u8]) -> Option<Vec<u8>> {
         if delivered_region.len() < PACKET_SIZE - HEADER_LEN {
             return None;
         }
         let mut buf = delivered_region.to_vec();
-        // Undo the hops' decryptions (applied in path order) by re-encrypting in
-        // reverse order → recovers the reply_key-wrapped region the user shipped.
         for k in self.payload_keys.iter().rev() {
             lioness::encrypt(k, &mut buf);
         }
-        // Unwrap the outer reply layer.
         lioness::decrypt(&self.reply_key, &mut buf);
 
         let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
@@ -263,9 +177,6 @@ impl SurbKeys {
     }
 }
 
-/// Ship a `reply` back to the SURB's creator through the mixnet. Opens a fresh
-/// QUIC + Noise XK connection to the SURB's first hop and injects the reply
-/// packet — the caller (a mailbox host) never learns the recipient's address.
 pub async fn ship_surb_reply(
     endpoint: &quinn::Endpoint,
     my_sk: &[u8; 32],
@@ -336,7 +247,6 @@ mod tests {
         }
     }
 
-    /// Spawn a relay; `delivery=Some` makes it a local-delivery endpoint.
     async fn spawn_relay(sk: [u8; 32], delivery: Option<DeliveryHandler>) -> SocketAddrV4 {
         let server = build_server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
         let bound = server.local_addr().unwrap();
@@ -361,12 +271,6 @@ mod tests {
         }
     }
 
-    /// F-30 — the reply path must not be identifiable from `delay_micros`.
-    ///
-    /// This is the test whose absence let the mix-delay fix be called finished
-    /// while it covered one direction only. The forward path clamps to
-    /// `.max(1)`, so `0` is a value a real packet can never carry: writing it in
-    /// every reply record flagged the whole return direction on the wire.
     #[test]
     fn a_reply_hop_delay_is_drawn_from_the_same_law_as_a_forward_one() {
         use crypto_gotham::cover::CoverMode;
@@ -382,14 +286,12 @@ mod tests {
                 .map(|_| reply_hop_delay_micros(mode, &mut r))
                 .collect();
 
-            // The sentinel must never appear: it is what identified a reply.
             assert!(
                 samples.iter().all(|d| *d != 0),
                 "{mode:?}: a reply carried the reserved 0, which is a free \
                  forward/reply distinguisher",
             );
 
-            // Exp(λ) with the mode's mean, same as `sender_hop_delay_micros`.
             let mean = samples.iter().map(|d| *d as f64).sum::<f64>() / n as f64;
             let expected = mode.mean_hop_delay_micros() as f64;
             assert!(
@@ -397,8 +299,6 @@ mod tests {
                 "{mode:?}: mean {mean:.0} µs is not the forward law's {expected:.0} µs",
             );
 
-            // An exponential is not a constant: a fixed hold would pair packets
-            // by arrival order just as reliably as the sentinel did.
             let distinct = samples
                 .iter()
                 .collect::<std::collections::HashSet<_>>()
@@ -407,7 +307,6 @@ mod tests {
         }
     }
 
-    /// And the records a real SURB carries obey it too — not just the helper.
     #[test]
     fn a_built_surb_carries_no_sentinel_delay() {
         use crypto_gotham::cover::CoverMode;
@@ -424,8 +323,6 @@ mod tests {
         init();
         let mut r = ChaCha20Rng::seed_from_u64(0x050D_B0DB_0DB0);
 
-        // Return path: entry → mix → recipient(self). Only the recipient
-        // delivers locally; the host that ships the reply never learns its addr.
         let sk_entry = clamped_sk(&mut r);
         let sk_mix = clamped_sk(&mut r);
         let sk_self = clamped_sk(&mut r);
@@ -450,8 +347,6 @@ mod tests {
 
         let (surb, keys) = build_surb(&mut r, &path).expect("build surb");
 
-        // A "mailbox host" ships a reply via the SURB — it only knows the SURB's
-        // first hop (an entry relay), never the recipient's address.
         let reply = b"MailboxResponse::Delivery { sealed envelopes... }".to_vec();
         let host_ep = build_client_endpoint().unwrap();
         let host_sk = clamped_sk(&mut r);
@@ -459,7 +354,6 @@ mod tests {
             .await
             .expect("ship reply");
 
-        // The recipient receives the local delivery; open it with the SURB keys.
         let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("reply did not arrive")
@@ -479,7 +373,6 @@ mod tests {
         init();
         let mut r = ChaCha20Rng::seed_from_u64(0x0F17_C450_DB00);
 
-        // Recipient's SURB return path: entry → mix → self(capture).
         let sk_entry = clamped_sk(&mut r);
         let sk_mix = clamped_sk(&mut r);
         let sk_self = clamped_sk(&mut r);
@@ -500,15 +393,11 @@ mod tests {
         };
         let (surb, keys) = build_surb(&mut r, &path).expect("build surb");
 
-        // A mailbox host holding one deposited (already-sealed) envelope.
         let recipient_sk = clamped_sk(&mut r);
         let recipient_pk = PublicKey::from(&StaticSecret::from(recipient_sk)).to_bytes();
         let id = mailbox_id_for(&recipient_pk);
         let stored = b"a sealed envelope for the recipient".to_vec();
         let mut mailbox = Mailbox::with_defaults();
-        // Deposit with the real wall-clock `now` so the entry's TTL is live when
-        // the handler fetches (it uses now_unix()); a `now=0` deposit would look
-        // expired against the real clock and drain to an empty batch.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -523,12 +412,6 @@ mod tests {
         let handler = crate::transport::make_mailbox_service_handler(host_sk, mailbox)
             .expect("service handler");
 
-        // Recipient sends a FetchWithSurb — as it would arrive at the host over
-        // the mixnet: a sealed-sender envelope (sealed FOR the host) wrapping the
-        // request. The host unseals it, drains the mailbox, ships the reply back
-        // through the SURB. The host never sees the recipient's address.
-        // The fetch carries the SEC-MBX-01 possession proof, bound to this very
-        // reply block so it cannot be lifted onto a SURB pointing elsewhere.
         let surb_bytes = surb.to_bytes().unwrap();
         let auth = crate::mailbox_client::fetch_auth_for(
             &recipient_sk,
@@ -542,8 +425,6 @@ mod tests {
             auth: Some(auth),
         };
         let apparent_sender = clamped_sk(&mut r);
-        // Frame exactly as the mixnet delivers it (4 B length prefix + sealed
-        // envelope) — the same bytes `GothamClient::send_sealed_to_exit` ships.
         let framed_req = crate::client::GothamClient::seal_and_frame(
             &mut r,
             &host_pk,
@@ -553,7 +434,6 @@ mod tests {
         .unwrap();
         handler(framed_req);
 
-        // Recipient receives the SURB reply locally and recovers it.
         let delivered = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("surb reply did not arrive")
@@ -576,8 +456,6 @@ mod tests {
         init();
         let mut r = ChaCha20Rng::seed_from_u64(0x00BA_D515_E000);
 
-        // Minimal SURB (its return path is irrelevant here — the reply never
-        // ships because it's too large; we assert the drained message survives).
         let sk_a = clamped_sk(&mut r);
         let sk_self = clamped_sk(&mut r);
         let hops = [
@@ -589,7 +467,6 @@ mod tests {
         };
         let (surb, _keys) = build_surb(&mut r, &path).expect("build surb");
 
-        // One stored message bigger than a mixnet packet payload.
         let recipient_sk = clamped_sk(&mut r);
         let recipient_pk = PublicKey::from(&StaticSecret::from(recipient_sk)).to_bytes();
         let id = mailbox_id_for(&recipient_pk);
@@ -629,8 +506,6 @@ mod tests {
         .unwrap();
         handler(framed);
 
-        // The reply is too large for one SURB packet → the handler must have
-        // RE-DEPOSITED the message rather than dropping it. Poll until it's back.
         let mut recovered = false;
         for _ in 0..40 {
             {
@@ -640,7 +515,6 @@ mod tests {
                     recovered = true;
                     break;
                 }
-                // Not yet re-deposited — put back anything we might have drained.
                 for env in batch {
                     let _ = mb.deposit(id, env, now, 0);
                 }

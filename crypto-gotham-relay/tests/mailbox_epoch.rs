@@ -1,20 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial
 // Copyright (C) 2026 0x9Angel.
 
-//! NET-01 — a mailbox deposited at a per-epoch address must be fetchable.
-//!
-//! F-07 (2.4.0) moved every deposit to `mailbox_id_for_deposit` and every read
-//! to `mailbox_ids_to_read`, while the relay's possession check still accepted
-//! the permanent address alone. The deposit was acknowledged and the fetch
-//! refused as `Unauthorized`, so mail between two 2.4.x clients sat on the relay
-//! until it expired. The unit tests on the ownership window cannot see that; this
-//! runs the real relay serve loop and the real client over QUIC + Noise, with
-//! the relay's real clock, which is the configuration that failed.
-//!
-//! ```text
-//! cargo test -p crypto-gotham-relay --test mailbox_epoch
-//! ```
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,9 +29,6 @@ fn public(sk: [u8; 32]) -> [u8; 32] {
     PublicKey::from(&StaticSecret::from(sk)).to_bytes()
 }
 
-/// What a client would take as `valid_after`: a directory signed just now.
-/// The relay under test reads the same clock, which is the deployed situation
-/// when the fleet and the authority keep time.
 fn freshly_signed_directory_stamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -53,7 +36,6 @@ fn freshly_signed_directory_stamp() -> u64 {
         .as_secs()
 }
 
-/// A mailbox-hosting relay on 127.0.0.1:0, served by the production loop.
 async fn spawn_mailbox_relay(sk: [u8; 32]) -> (SocketAddr, [u8; 32], Arc<Mutex<Mailbox>>) {
     crypto_gotham_relay::init_crypto();
     let endpoint = build_server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -67,8 +49,6 @@ async fn spawn_mailbox_relay(sk: [u8; 32]) -> (SocketAddr, [u8; 32], Arc<Mutex<M
     (addr, public(sk), store)
 }
 
-/// The whole F-07 read set, end to end: the deposit address, both addresses a
-/// recipient reads, and the permanent one it still drains.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_address_a_client_reads_is_fetchable_after_a_deposit() {
     let mut rng = ChaCha20Rng::seed_from_u64(0x0E90_C4E1);
@@ -87,8 +67,6 @@ async fn every_address_a_client_reads_is_fetchable_after_a_deposit() {
     );
 
     let client = MailboxClient::new(&mut rng).unwrap();
-    // What a 2.4.x sender does, plus a sender one epoch behind, plus a pre-2.4
-    // sender still on the permanent address.
     client
         .deposit(addr, &relay_pk, deposit_at, b"this epoch".to_vec(), 3600)
         .await
@@ -103,8 +81,6 @@ async fn every_address_a_client_reads_is_fetchable_after_a_deposit() {
         .expect("deposit at the legacy address");
     assert_eq!(store.lock().await.total(), 3);
 
-    // The recipient reads the three addresses exactly as `poll_mailbox` does.
-    // Before the fix the first two came back `Unauthorized`.
     let got = client
         .fetch_all(addr, &relay_pk, current, &recipient_sk)
         .await
@@ -128,9 +104,6 @@ async fn every_address_a_client_reads_is_fetchable_after_a_deposit() {
     );
 }
 
-/// Widening what the relay accepts must not widen WHO it accepts: a key that
-/// proves possession of its own secret still cannot drain another key's epoch
-/// address, and the victim's mail survives the attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn another_keys_epoch_address_is_refused() {
     let mut rng = ChaCha20Rng::seed_from_u64(0x0E90_BAD0);

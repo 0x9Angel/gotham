@@ -1,36 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial
 // Copyright (C) 2026 0x9Angel.
 
-//! Relay self-enrollment + authority-side registry — the Level-1 automated
-//! directory.
-//!
-//! In v0.1 the operator hand-built a signed directory. This module replaces
-//! that with a self-forming roster:
-//!
-//! 1. A relay POSTs a [`RelayEnrollment`] (its X25519 routing/KEM key + the
-//!    address it is reachable on + the tier it serves) to the directory
-//!    authority, and re-POSTs it as a heartbeat every few minutes.
-//! 2. The authority keeps live enrollments in a [`Registry`], drops any that
-//!    stop heartbeating ([`Registry::prune_at`]), and on demand bakes the live
-//!    set into an authority-signed [`SignedDirectory`]
-//!    ([`Registry::build_signed_at`]) — exactly the artifact the app already
-//!    verifies and consumes.
-//!
-//! ## Authentication (honest scope)
-//!
-//! This module enforces *shape* + *anti-replay* (monotonic `seq` per key).
-//! It deliberately does NOT prove possession of the X25519 secret — that is
-//! the caller's job:
-//!
-//! - **Closed test (today):** the HTTP authority gates `/enroll` behind an
-//!   operator-issued bearer token + per-IP rate limit, so only trusted
-//!   volunteers can enroll. A bogus entry that does not hold the secret simply
-//!   cannot decrypt traffic routed to it (an availability nuisance, not an
-//!   anonymity break).
-//! - **Hardening (next):** a Noise-XK liveness probe from the authority to the
-//!   advertised address proves both reachability *and* possession of the
-//!   X25519 secret before the relay is listed.
-
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,36 +12,17 @@ use crate::directory::{
 };
 use crate::error::{Error, Result};
 
-/// Wire-format version for [`RelayEnrollment`]. Bump on any breaking change.
 pub const ENROLL_VERSION: u8 = 1;
 
-/// How long an enrollment stays live without a fresh heartbeat before the
-/// authority evicts it (seconds). A relay re-announces well within this.
-pub const ENROLL_STALE_AFTER_SECS: u64 = 1800; // 30 min
+pub const ENROLL_STALE_AFTER_SECS: u64 = 1800;
 
-/// Bucket width (seconds) for the k-of-n admission **epoch** a relay proposes on
-/// enrollment (1 day). Rationale: for several independent authorities to sign
-/// the SAME `(identity, epoch, operator)` message — the only way their
-/// attestations combine into one [`crypto_gotham_directory::AdmissionCert`] — the
-/// relay must send an IDENTICAL epoch to each. Bucketing `now` to the day makes
-/// that value stable across the relay's own ~60 s heartbeats (so the signed
-/// message doesn't churn every beat) while still advancing daily, which bounds
-/// admission-revocation latency (authorities revoke by declining to re-sign a
-/// newer epoch). The relay picks ONE bucketed value and sends it verbatim to all
-/// authorities; each authority only validates the value is recent (see the
-/// authority binary) before signing it, so a day-boundary race is impossible —
-/// the authorities sign the relay's number, they don't recompute it.
 pub const ATTEST_EPOCH_BUCKET_SECS: u64 = 86_400;
 
-/// The current admission epoch a relay should propose at `now`: `now` floored to
-/// the [`ATTEST_EPOCH_BUCKET_SECS`] bucket. Stable within a day, monotonic across
-/// days.
 #[must_use]
 pub fn current_attest_epoch(now: u64) -> u64 {
     (now / ATTEST_EPOCH_BUCKET_SECS) * ATTEST_EPOCH_BUCKET_SECS
 }
 
-/// Current Unix-seconds timestamp, or `0` if the clock is before the epoch.
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -79,69 +30,30 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// A relay's self-submitted claim to the directory authority.
-///
-/// The same struct is used for the first enrollment and for every subsequent
-/// heartbeat — only `seq` changes (it must strictly increase per key).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RelayEnrollment {
-    /// Must equal [`ENROLL_VERSION`].
     pub version: u8,
-    /// X25519 public key, hex-encoded (64 chars / 32 bytes). This is both the
-    /// relay's routing identity (`next_node_id`) and its Sphinx KEM key.
     pub kem_pubkey_hex: String,
-    /// Reachable socket address, e.g. `"203.0.113.7:443"`.
     pub addr: String,
-    /// Tier the operator is willing to serve.
     pub tier: RelayTier,
-    /// Optional ISO 3166-1 alpha-2 country code (`"FR"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
-    /// Optional free-form operator nickname (transparency only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
-    /// Monotonic heartbeat counter — bumped on every re-announce.
     pub seq: u64,
-    /// RFC B3: when set, this relay is behind CGNAT and reachable only via the
-    /// rendezvous relay whose X25519 key (`kem_pubkey_hex`) is this hex string;
-    /// `addr` is then empty and the authority proves liveness by ASKING R,
-    /// not by dialing back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rendezvous: Option<String>,
-    /// RFC B3: this directly-reachable relay is willing to serve as a rendezvous
-    /// point for CGNAT relays.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rendezvous_capable: bool,
-    /// RFC B3 §4: hex DH-MAC **proof of possession** for a rendezvous-hosted
-    /// (CGNAT) relay, which cannot be dialed back. It is
-    /// [`pop_tag`](Self::pop_tag)`(DH(relay_sk, authority_pop_pk), kem, seq)` —
-    /// only the holder of `relay_sk` can produce it, and it binds possession to
-    /// this `kem_pubkey_hex` + `seq`, so the authority proves possession WITHOUT
-    /// trusting the rendezvous relay. Required for rendezvous enrollment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pop_proof: Option<String>,
-    /// k-of-n decentralised admission (the multi-authority trust anchor): the
-    /// epoch this relay proposes for its admission attestation, IDENTICAL across
-    /// every authority it enrolls with (see [`current_attest_epoch`]). Each
-    /// authority signs `(kem_pubkey_hex, attest_epoch, operator)` and serves the
-    /// resulting attestation; a consuming app pins the authority set and admits
-    /// the relay only once `k` distinct authorities have attested this exact
-    /// tuple. `None` on legacy single-authority enrollments (no attestation is
-    /// issued — the relay is then only admissible via the blanket-signed
-    /// directory, the transition path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attest_epoch: Option<u64>,
-    /// Whether this relay hosts a store-and-forward mailbox (`--mailbox`). When
-    /// true the authority advertises it as `mailbox` in the relay's directory
-    /// descriptor so clients can pick it for offline/NAT'd delivery. Additive;
-    /// absent (false) for relays that don't host one. Mirrors how
-    /// `rendezvous_capable` is self-declared through enrollment.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mailbox: bool,
 }
 
 impl RelayEnrollment {
-    /// Build a fresh enrollment at `seq` (caller starts at 1 and bumps).
     pub fn new(
         kem_pubkey_hex: String,
         addr: String,
@@ -166,30 +78,18 @@ impl RelayEnrollment {
         }
     }
 
-    /// Advertise that this relay hosts a store-and-forward mailbox (`--mailbox`),
-    /// so the authority sets the `mailbox` flag on its directory descriptor.
     #[must_use]
     pub fn with_mailbox(mut self, yes: bool) -> Self {
         self.mailbox = yes;
         self
     }
 
-    /// Propose an admission `epoch` for k-of-n decentralised attestation. The
-    /// caller MUST use the SAME value (see [`current_attest_epoch`]) for every
-    /// authority it enrolls with, so their attestations sign an identical
-    /// message and combine into one quorum certificate.
     #[must_use]
     pub fn with_attest_epoch(mut self, epoch: u64) -> Self {
         self.attest_epoch = Some(epoch);
         self
     }
 
-    /// RFC B3 §4 DH-MAC possession tag. `shared` is the X25519 secret
-    /// `DH(relay_sk, authority_pop_pk)` (equivalently `DH(authority_pop_sk,
-    /// relay_kem_pk)` on the authority side). The tag binds possession of the
-    /// relay key to `kem_pubkey` + `seq`: only a holder of `relay_sk` can compute
-    /// `shared`, and a captured tag cannot be replayed for a different key or a
-    /// higher `seq`. Independent of any rendezvous relay.
     #[must_use]
     pub fn pop_tag(shared: &[u8; 32], kem_pubkey: &[u8; 32], seq: u64) -> [u8; 32] {
         let k = blake3::derive_key("gotham-rendezvous-pop-v1", shared);
@@ -199,12 +99,6 @@ impl RelayEnrollment {
         *h.finalize().as_bytes()
     }
 
-    /// Canonical hash of the WHOLE enrollment except `pop_proof` itself — the
-    /// transcript the v2 possession proof commits to.
-    ///
-    /// Every field is length-prefixed and `Option`s carry an explicit
-    /// present/absent tag, so no two distinct enrollments can produce the same
-    /// digest by shifting bytes between adjacent fields.
     #[must_use]
     pub fn binding_hash(&self) -> [u8; 32] {
         fn put_str(h: &mut blake3::Hasher, s: &str) {
@@ -246,27 +140,6 @@ impl RelayEnrollment {
         *h.finalize().as_bytes()
     }
 
-    /// v2 possession tag: binds `shared` to the ENTIRE enrollment transcript.
-    ///
-    /// [`pop_tag`](Self::pop_tag) covers only `(kem_pubkey, seq)`, which leaves
-    /// `addr`, `tier`, `operator`, `country`, `mailbox` and
-    /// `rendezvous_capable` unauthenticated. Enrollments are POSTed as JSON over
-    /// plain HTTP (the shipped installers default to `http://<authority>:8443`),
-    /// so an on-path attacker could rewrite those fields in flight, leave
-    /// `kem_pubkey_hex` / `seq` / `pop_proof` intact, and have the authority
-    /// accept and then Ed25519-SIGN the tampered descriptor — laundering the
-    /// tampering into a document every client trusts. Repointing `addr` hands
-    /// the attacker an on-path position at the entry tier; rewriting `operator`
-    /// or `country` defeats the path-diversity guards; flipping `mailbox`
-    /// silently blackholes offline delivery.
-    ///
-    /// The liveness dial-back does not close this: it only proves *something at
-    /// `addr` speaks Noise-XK as this key*, which a plain UDP forwarder in front
-    /// of the real relay satisfies, and it says nothing at all about the other
-    /// fields.
-    ///
-    /// A distinct `derive_key` context from v1 means a captured v1 tag can never
-    /// be replayed as a v2 tag.
     #[must_use]
     pub fn pop_tag_v2(shared: &[u8; 32], binding: &[u8; 32]) -> [u8; 32] {
         let k = blake3::derive_key("gotham-enroll-pop-v2", shared);
@@ -275,9 +148,6 @@ impl RelayEnrollment {
         *h.finalize().as_bytes()
     }
 
-    /// Verify a [`pop_tag_v2`](Self::pop_tag_v2) transcript-bound proof against
-    /// the authority's side of the DH. Constant-time; `false` if the proof is
-    /// absent, malformed, or does not match this exact enrollment.
     #[must_use]
     pub fn verify_pop_v2(&self, shared: &[u8; 32]) -> bool {
         let Some(hexstr) = &self.pop_proof else {
@@ -297,17 +167,12 @@ impl RelayEnrollment {
         diff == 0
     }
 
-    /// Attach a hex-encoded [`pop_tag`](Self::pop_tag) possession proof.
     #[must_use]
     pub fn with_pop_proof(mut self, tag_hex: String) -> Self {
         self.pop_proof = Some(tag_hex);
         self
     }
 
-    /// Verify an RFC B3 §4 possession proof: recompute the DH-MAC from `shared`
-    /// (the authority's side `DH(authority_pop_sk, relay_kem_pk)`) and compare it
-    /// to `self.pop_proof` in constant time. Returns `false` if the proof is
-    /// absent, malformed, or does not match.
     #[must_use]
     pub fn verify_pop(&self, shared: &[u8; 32]) -> bool {
         let Some(hexstr) = &self.pop_proof else {
@@ -326,7 +191,6 @@ impl RelayEnrollment {
             return false;
         };
         let expected = Self::pop_tag(shared, &kem, self.seq);
-        // Constant-time compare.
         let mut diff = 0u8;
         for i in 0..32 {
             diff |= provided[i] ^ expected[i];
@@ -334,27 +198,18 @@ impl RelayEnrollment {
         diff == 0
     }
 
-    /// Mark this enrollment as CGNAT-hosted via rendezvous relay `r_kem_hex`
-    /// (RFC B3). The relay's `addr` should be empty.
     #[must_use]
     pub fn with_rendezvous(mut self, r_kem_hex: String) -> Self {
         self.rendezvous = Some(r_kem_hex);
         self
     }
 
-    /// Mark this directly-reachable relay as willing to host CGNAT relays.
     #[must_use]
     pub fn with_rendezvous_capable(mut self, yes: bool) -> Self {
         self.rendezvous_capable = yes;
         self
     }
 
-    /// Validate the shape: version, a 32-byte hex key, and (for a directly-
-    /// reachable relay) a parseable, routable socket address. Does NOT prove key
-    /// possession (see module docs). Returns the parsed `SocketAddr` for a
-    /// direct relay, or `None` for an RFC B3 rendezvous-hosted relay (which has
-    /// no dialable address — the authority proves it live by asking its
-    /// rendezvous relay instead of dialing back).
     pub fn validate(&self) -> Result<Option<std::net::SocketAddr>> {
         if self.version != ENROLL_VERSION {
             return Err(Error::Directory("unsupported enrollment version"));
@@ -364,9 +219,6 @@ impl RelayEnrollment {
         if key.len() != 32 {
             return Err(Error::Directory("kem_pubkey wrong length"));
         }
-        // RFC B3: a rendezvous-hosted relay carries a valid rendezvous key and no
-        // dialable address. It cannot ALSO be rendezvous_capable (a hosted relay
-        // cannot host). The addr field is ignored (should be empty).
         if let Some(r) = &self.rendezvous {
             if self.rendezvous_capable {
                 return Err(Error::Directory(
@@ -386,11 +238,6 @@ impl RelayEnrollment {
         if sa.ip().is_unspecified() {
             return Err(Error::Directory("addr must not be the unspecified address"));
         }
-        // Reject loopback: a loopback relay is unreachable by others AND defeats
-        // the path selector's /16 diversity check (which relaxes for 127.0.0.0/8
-        // so local tests can share a host). Rejecting it at ingest keeps that
-        // relaxation from ever applying to a real signed directory, so one host
-        // can't smuggle two loopback relays onto both ends of a flow.
         if sa.ip().is_loopback() {
             return Err(Error::Directory("addr must not be a loopback address"));
         }
@@ -400,9 +247,6 @@ impl RelayEnrollment {
         Ok(Some(sa))
     }
 
-    /// Project into a [`RelayDescriptor`]. The X25519 key fills both the
-    /// identity and KEM slots (the relay has a single key), matching the
-    /// `sign-directory` convention.
     fn to_descriptor(&self) -> RelayDescriptor {
         RelayDescriptor {
             id_pubkey_hex: self.kem_pubkey_hex.clone(),
@@ -413,66 +257,39 @@ impl RelayEnrollment {
             asn: None,
             operator: self.operator.clone(),
             uptime_pct: None,
-            // Self-declared via enrollment (`--mailbox`), like rendezvous_capable,
-            // so a mailbox host is discoverable in the auto-built directory.
             mailbox: self.mailbox,
-            // RFC B3: carry the reverse-transport reachability through to the
-            // routable descriptor so the path selector treats a CGNAT relay as
-            // reachable-via-R (and inherits R's diversity position).
             rendezvous: self.rendezvous.clone(),
             rendezvous_capable: self.rendezvous_capable,
         }
     }
 }
 
-/// Derive the authority's stable X25519 PoP secret from its Ed25519 signing-key
-/// seed (RFC B3 §4). Deterministic, so the PoP public key is fixed across
-/// authority restarts and CGNAT relays can pin it as `--authority-pop-key`.
 #[must_use]
 pub fn derive_authority_pop_sk(ed25519_seed: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("gotham-authority-pop-x25519-v1", ed25519_seed)
 }
 
-/// One live relay as tracked by the authority.
 #[derive(Debug, Clone)]
 struct RegEntry {
     enrollment: RelayEnrollment,
-    /// Unix-seconds of the most recent accepted heartbeat.
     last_seen: u64,
-    /// Unix-seconds of the FIRST enrolment of this key.
-    ///
-    /// F-60 — seniority, and it exists to decide who survives a full diversity
-    /// bucket. Carried forward across heartbeats: rebuilding it on every
-    /// heartbeat would make every relay permanently brand new, which is the
-    /// same as not having it.
     first_seen: u64,
 }
 
-/// In-memory roster of live relays held by the directory authority.
-///
-/// Keyed by `kem_pubkey_hex`. Enforces monotonic `seq` per key (anti-replay)
-/// and evicts entries that stop heartbeating.
 #[derive(Debug, Default)]
 pub struct Registry {
     entries: HashMap<String, RegEntry>,
 }
 
 impl Registry {
-    /// Empty registry.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Enroll or heartbeat a relay against the wall clock.
     pub fn enroll(&mut self, e: RelayEnrollment) -> Result<()> {
         self.enroll_at(e, now_unix())
     }
 
-    /// Enroll or heartbeat at an injected timestamp (deterministic tests).
-    ///
-    /// Validates the enrollment shape, rejects a `seq` that is not strictly
-    /// greater than the one already on file for this key (replay / rollback),
-    /// then records it with `last_seen = now`.
     pub fn enroll_at(&mut self, e: RelayEnrollment, now: u64) -> Result<()> {
         e.validate()?;
         if let Some(existing) = self.entries.get(&e.kem_pubkey_hex) {
@@ -480,7 +297,6 @@ impl Registry {
                 return Err(Error::Directory("enrollment seq not increasing (replay)"));
             }
         }
-        // Seniority survives the heartbeat that refreshes the entry.
         let first_seen = self
             .entries
             .get(&e.kem_pubkey_hex)
@@ -497,8 +313,6 @@ impl Registry {
         Ok(())
     }
 
-    /// Evict every relay whose last heartbeat is older than
-    /// [`ENROLL_STALE_AFTER_SECS`]. Returns the number evicted.
     pub fn prune_at(&mut self, now: u64) -> usize {
         let cutoff = now.saturating_sub(ENROLL_STALE_AFTER_SECS);
         let before = self.entries.len();
@@ -506,22 +320,14 @@ impl Registry {
         before - self.entries.len()
     }
 
-    /// Number of relays currently on file (call [`prune_at`](Self::prune_at)
-    /// first for the live count).
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// `true` when no relays are enrolled.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// RFC B3: the `(addr, kem-pubkey)` of a directly-reachable, rendezvous-
-    /// capable relay identified by its kem-hex — or `None` if it is unknown,
-    /// itself rendezvous-hosted, or not willing to host. The authority uses this
-    /// to verify a CGNAT relay's liveness via its rendezvous point instead of
-    /// dialing the (unreachable) relay directly.
     pub fn rendezvous_point(&self, kem_hex: &str) -> Option<(std::net::SocketAddr, [u8; 32])> {
         let e = &self.entries.get(kem_hex)?.enrollment;
         if e.rendezvous.is_some() || !e.rendezvous_capable {
@@ -532,20 +338,6 @@ impl Registry {
         Some((addr, pk))
     }
 
-    /// Order relays so the diversity caps keep the ESTABLISHED ones.
-    ///
-    /// F-60 — the input used to be sorted by `id_pubkey_hex`, and
-    /// `apply_diversity_caps` keeps whatever comes first in a full bucket. The
-    /// identity IS the relay's own X25519 key, freely regenerable, so an attacker
-    /// grinds keys with a low hex prefix and their relays win every contested
-    /// bucket — evicting the honest relays in the victim's /24 at a cost of about
-    /// 2^8 tries per nibble pair, with `MAX_RELAYS_PER_24 = 3` meaning three VMs
-    /// in that /24 are enough.
-    ///
-    /// Seniority first, then a HASH of the identity rather than the identity
-    /// itself: grinding a key no longer buys priority, because the tie-break is a
-    /// value the attacker cannot steer toward "low" any more cheaply than toward
-    /// any other target — and seniority cannot be ground at all, only waited for.
     fn order_for_diversity_caps(
         entries: &std::collections::HashMap<String, RegEntry>,
         descriptors: &mut [RelayDescriptor],
@@ -562,19 +354,6 @@ impl Registry {
         });
     }
 
-    /// k-of-n decentralised admission: the `(identity_hex, epoch, operator)` of
-    /// every LIVE relay that proposed an admission epoch AND survives the same
-    /// diversity caps as the signed directory. The authority signs each tuple on
-    /// demand to serve at `GET /admissions` — it stores no attestations, so the
-    /// served set always tracks the live registry (a pruned relay disappears
-    /// from admissions too). Call [`prune_at`](Self::prune_at) first.
-    ///
-    /// Bounding to the capped set matters two ways: (1) an attestation for a
-    /// relay the directory won't list is useless to the app (it iterates the
-    /// listed descriptors), and (2) it caps the per-request signing work to the
-    /// SAME bounded set `/directory` already exposes — so `/admissions` can't be
-    /// turned into an O(registry) Ed25519-signing CPU amplifier by inflating the
-    /// registry past the caps.
     pub fn admission_inputs(&self) -> Vec<(String, u64, Option<String>)> {
         let mut descriptors: Vec<RelayDescriptor> = self
             .entries
@@ -592,9 +371,6 @@ impl Registry {
             .collect()
     }
 
-    /// How many distinct tiers are currently represented. A working 3-hop
-    /// mixnet needs entry + mix + exit, so the authority can warn when this
-    /// is `< 3`.
     pub fn tier_coverage(&self) -> usize {
         let mut tiers = [false; 3];
         for v in self.entries.values() {
@@ -607,9 +383,6 @@ impl Registry {
         tiers.iter().filter(|t| **t).count()
     }
 
-    /// Bake the live roster into an authority-signed [`SignedDirectory`] valid
-    /// for `valid_secs`. Descriptors are sorted by key for deterministic
-    /// signing.
     pub fn build_signed(&self, authority: &SigningKey, valid_secs: u64) -> Result<SignedDirectory> {
         let mut descriptors: Vec<RelayDescriptor> = self
             .entries
@@ -617,8 +390,6 @@ impl Registry {
             .map(|v| v.enrollment.to_descriptor())
             .collect();
         Self::order_for_diversity_caps(&self.entries, &mut descriptors);
-        // Bound how much of the directory any one subnet/operator can be, so an
-        // open flood of relays can't buy a proportional share of path selection.
         let descriptors = apply_diversity_caps(descriptors);
         let doc = DirectoryDoc::new(descriptors, std::time::Duration::from_secs(valid_secs))?;
         SignedDirectory::sign(doc, authority)
@@ -650,11 +421,8 @@ mod tests {
 
     #[test]
     fn validate_accepts_rendezvous_hosted_relay_without_addr() {
-        // RFC B3: a CGNAT relay carries a rendezvous key and an empty addr, and
-        // validates to `None` (no dialable socket).
         let e = enrollment(&keyhex(1), "", RelayTier::Mix, 1).with_rendezvous(keyhex(2));
         assert!(e.validate().unwrap().is_none());
-        // A hosted relay that also claims to be a rendezvous point is rejected.
         let bad = enrollment(&keyhex(1), "", RelayTier::Mix, 1)
             .with_rendezvous(keyhex(2))
             .with_rendezvous_capable(true);
@@ -664,13 +432,11 @@ mod tests {
     #[test]
     fn pop_proof_roundtrips_and_binds_key_and_seq() {
         use x25519_dalek::{PublicKey, StaticSecret};
-        // Authority PoP key (stable, derived) + a relay's X25519 key.
         let auth_sk = derive_authority_pop_sk(&[7u8; 32]);
         let auth_pk = PublicKey::from(&StaticSecret::from(auth_sk));
         let relay_sk = [9u8; 32];
         let relay_pk = PublicKey::from(&StaticSecret::from(relay_sk)).to_bytes();
 
-        // N builds the proof from DH(relay_sk, auth_pk).
         let shared_n = StaticSecret::from(relay_sk).diffie_hellman(&auth_pk);
         let e = RelayEnrollment::new(
             hex::encode(relay_pk),
@@ -687,15 +453,12 @@ mod tests {
             5,
         )));
 
-        // The authority verifies from DH(auth_sk, relay_pk) — the same secret.
         let shared_a = StaticSecret::from(auth_sk).diffie_hellman(&PublicKey::from(relay_pk));
         assert!(
             e.verify_pop(shared_a.as_bytes()),
             "a valid proof must verify"
         );
 
-        // Bound to seq: the same proof must not verify for a different seq (this
-        // is what stops a captured proof from hijacking a key with a higher seq).
         let mut e_seq = e.clone();
         e_seq.seq = 6;
         assert!(
@@ -703,14 +466,12 @@ mod tests {
             "proof must be bound to seq"
         );
 
-        // An attacker WITHOUT the authority's PoP secret cannot forge it.
         let wrong = StaticSecret::from([2u8; 32]).diffie_hellman(&PublicKey::from(relay_pk));
         assert!(
             !e.verify_pop(wrong.as_bytes()),
             "proof must not verify under a wrong secret"
         );
 
-        // An enrollment with no proof at all is rejected.
         let none = RelayEnrollment::new(
             hex::encode(relay_pk),
             String::new(),
@@ -728,19 +489,14 @@ mod tests {
     #[test]
     fn attest_epoch_is_day_bucketed_and_stable_within_a_day() {
         let bucket = ATTEST_EPOCH_BUCKET_SECS;
-        // Two instants in the SAME day bucket the same value — so a relay's
-        // ~60 s heartbeats propose an identical epoch to every authority.
         let day_start = 1_700_000_000 / bucket * bucket;
         assert_eq!(current_attest_epoch(day_start), day_start);
         assert_eq!(current_attest_epoch(day_start + 59), day_start);
         assert_eq!(current_attest_epoch(day_start + bucket - 1), day_start);
-        // The next day advances the bucket by exactly one width.
         assert_eq!(current_attest_epoch(day_start + bucket), day_start + bucket);
-        // The builder threads it onto the enrollment.
         let e = enrollment(&keyhex(1), "203.0.113.7:443", RelayTier::Entry, 1)
             .with_attest_epoch(day_start);
         assert_eq!(e.attest_epoch, Some(day_start));
-        // It round-trips through the wire format additively (absent by default).
         let plain = enrollment(&keyhex(1), "203.0.113.7:443", RelayTier::Entry, 1);
         assert_eq!(plain.attest_epoch, None);
         let json = serde_json::to_string(&plain).unwrap();
@@ -760,7 +516,6 @@ mod tests {
         assert!(e.validate().is_err());
         e = enrollment(&keyhex(1), "203.0.113.7:0", RelayTier::Entry, 1);
         assert!(e.validate().is_err());
-        // Loopback is rejected (defeats /16 path diversity + unreachable).
         e = enrollment(&keyhex(1), "127.0.0.1:443", RelayTier::Entry, 1);
         assert!(e.validate().is_err(), "loopback addr must be rejected");
         e = enrollment(&keyhex(1), "[::1]:443", RelayTier::Entry, 1);
@@ -770,7 +525,6 @@ mod tests {
     #[test]
     fn admission_inputs_filters_epoch_and_tracks_live_set() {
         let mut r = Registry::new();
-        // Two relays propose an admission epoch, one does not (legacy).
         r.enroll_at(
             enrollment(&keyhex(1), "203.0.113.7:443", RelayTier::Entry, 1).with_attest_epoch(1000),
             1000,
@@ -787,7 +541,6 @@ mod tests {
         )
         .unwrap();
         let inputs = r.admission_inputs();
-        // Only the two epoch-proposing relays are attestable.
         assert_eq!(inputs.len(), 2);
         assert!(inputs.iter().all(|(_, ep, _)| *ep == 1000));
         assert!(inputs.iter().any(|(k, _, _)| *k == keyhex(1)));
@@ -796,7 +549,6 @@ mod tests {
             !inputs.iter().any(|(k, _, _)| *k == keyhex(3)),
             "no-epoch relay excluded"
         );
-        // Pruning the live set drops it from admissions too.
         r.prune_at(1000 + ENROLL_STALE_AFTER_SECS + 1);
         assert!(r.admission_inputs().is_empty());
     }
@@ -810,7 +562,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.len(), 1);
-        // Heartbeat with a higher seq is accepted and refreshes last_seen.
         r.enroll_at(
             enrollment(&keyhex(1), "203.0.113.7:443", RelayTier::Entry, 2),
             2000,
@@ -819,12 +570,6 @@ mod tests {
         assert_eq!(r.len(), 1);
     }
 
-    /// The v1 possession proof covered only `(kem‖seq)`. Enrollments are POSTed
-    /// as JSON over plain HTTP, so an on-path attacker could rewrite every other
-    /// field in flight, leave `kem_pubkey_hex` / `seq` / `pop_proof` intact, and
-    /// have the authority accept AND Ed25519-sign the tampered descriptor into
-    /// the directory that every client trusts. The v2 proof must break on a
-    /// change to ANY field.
     #[test]
     fn the_possession_proof_covers_every_enrollment_field() {
         let shared = [7u8; 32];
@@ -850,20 +595,16 @@ mod tests {
             "an untampered enrollment must verify"
         );
 
-        // Every field an on-path attacker would want to rewrite.
         type Mutation = (&'static str, Box<dyn Fn(&mut RelayEnrollment)>);
         let mutations: Vec<Mutation> = vec![
-            // repoint the relay at an attacker-controlled host
             (
                 "addr",
                 Box::new(|e: &mut RelayEnrollment| e.addr = "198.51.100.9:443".into()),
             ),
-            // move it between tiers to steer path selection
             (
                 "tier",
                 Box::new(|e: &mut RelayEnrollment| e.tier = RelayTier::Exit),
             ),
-            // collide or split operator labels to defeat diversity caps
             (
                 "operator",
                 Box::new(|e: &mut RelayEnrollment| e.operator = Some("mallory".into())),
@@ -872,7 +613,6 @@ mod tests {
                 "country",
                 Box::new(|e: &mut RelayEnrollment| e.country = Some("US".into())),
             ),
-            // flip the mailbox flag to blackhole offline delivery
             (
                 "mailbox",
                 Box::new(|e: &mut RelayEnrollment| e.mailbox = false),
@@ -885,7 +625,6 @@ mod tests {
                 "rendezvous",
                 Box::new(|e: &mut RelayEnrollment| e.rendezvous = Some(keyhex(2))),
             ),
-            // break k-of-n quorum assembly by desyncing the epoch per authority
             (
                 "attest_epoch",
                 Box::new(|e: &mut RelayEnrollment| e.attest_epoch = Some(172_800)),
@@ -906,7 +645,6 @@ mod tests {
             );
         }
 
-        // Domain separation: a captured v1 tag is never a valid v2 tag.
         let kem = <[u8; 32]>::try_from(hex::decode(keyhex(1)).unwrap()).unwrap();
         let legacy = base
             .clone()
@@ -920,13 +658,9 @@ mod tests {
             "a v1 tag must NOT be accepted as a v2 transcript-bound proof"
         );
 
-        // …and a v2 tag is not accepted by the legacy verifier either.
         assert!(!signed.verify_pop(&shared));
     }
 
-    /// Two different enrollments must never hash to the same binding — the
-    /// length prefixes exist so bytes cannot be shifted between adjacent
-    /// fields (e.g. operator "ab"+country "c" vs operator "a"+country "bc").
     #[test]
     fn the_binding_hash_is_unambiguous_across_adjacent_string_fields() {
         let mk = |country: Option<&str>, operator: Option<&str>| {
@@ -943,7 +677,6 @@ mod tests {
             mk(Some("ab"), Some("c")).binding_hash(),
             mk(Some("a"), Some("bc")).binding_hash()
         );
-        // An absent field is distinguishable from an empty one.
         assert_ne!(
             mk(None, Some("x")).binding_hash(),
             mk(Some(""), Some("x")).binding_hash()
@@ -978,10 +711,8 @@ mod tests {
             1000,
         )
         .unwrap();
-        // Still fresh just under the window.
         assert_eq!(r.prune_at(1000 + ENROLL_STALE_AFTER_SECS), 0);
         assert_eq!(r.len(), 1);
-        // One second past the window → evicted.
         assert_eq!(r.prune_at(1000 + ENROLL_STALE_AFTER_SECS + 1), 1);
         assert!(r.is_empty());
     }
@@ -1032,20 +763,10 @@ mod tests {
         signed.verify(&authority.verifying_key()).unwrap();
     }
 
-    /// F-60 — a ground identity key must not evict an established relay.
-    ///
-    /// `apply_diversity_caps` keeps whatever comes FIRST in a full bucket, and
-    /// the input was sorted by `id_pubkey_hex` — the relay's own X25519 key,
-    /// which its operator generates freely. So an attacker grinds keys with a
-    /// low hex prefix and wins every contested bucket. With
-    /// `MAX_RELAYS_PER_24 = 3`, three VMs in a victim's /24 were enough to push
-    /// the honest relays out of the served directory.
     #[test]
     fn seniority_decides_a_full_bucket_not_a_low_identity_key() {
         let mut reg = Registry::default();
 
-        // Three established relays in one /24, enrolled early. Their keys are
-        // high, as an honest randomly-generated key usually is.
         for (i, key) in [0xF1u8, 0xF2, 0xF3].iter().enumerate() {
             reg.enroll_at(
                 enrollment(
@@ -1059,7 +780,6 @@ mod tests {
             .unwrap();
         }
 
-        // The attacker arrives later with ground keys: the lowest possible.
         for (i, key) in [0x00u8, 0x01, 0x02].iter().enumerate() {
             reg.enroll_at(
                 enrollment(
@@ -1081,7 +801,6 @@ mod tests {
         Registry::order_for_diversity_caps(&reg.entries, &mut descriptors);
         let kept = crate::directory::apply_diversity_caps(descriptors);
 
-        // The bucket holds MAX_RELAYS_PER_24, and it holds the ESTABLISHED ones.
         assert_eq!(kept.len(), crate::directory::MAX_RELAYS_PER_24);
         for key in [0xF1u8, 0xF2, 0xF3] {
             assert!(
@@ -1097,9 +816,6 @@ mod tests {
         }
     }
 
-    /// Seniority must survive the heartbeat that refreshes an entry — carrying
-    /// it forward is the whole mechanism, and rebuilding it would make every
-    /// relay permanently brand new.
     #[test]
     fn a_heartbeat_does_not_reset_seniority() {
         let mut reg = Registry::default();

@@ -1,30 +1,4 @@
 #!/usr/bin/env bash
-# sign-directory.sh — Build a signed Gotham directory from your relay set.
-#
-# Run this LOCALLY (not on the VPS) after `install-relay.sh` has produced
-# a public key on each of your 3 relays.
-#
-# Usage:
-#   bash infra/scripts/sign-directory.sh \
-#       --relay-a "<HEX_PUBKEY_A>:<IP_A>:443" \
-#       --relay-b "<HEX_PUBKEY_B>:<IP_B>:443" \
-#       --relay-c "<HEX_PUBKEY_C>:<IP_C>:443" \
-#       --output  gotham-bootstrap.json
-#
-# Output: a JSON file the Crypto app reads at boot to learn the relay set.
-# Copy it to `<data_dir>/gotham/directory.json` on each app instance:
-#   - Linux:   ~/.crypto/gotham/directory.json
-#   - macOS:   ~/Library/Application Support/com.crypto.messenger/gotham/directory.json
-#   - Windows: %APPDATA%/com.crypto.messenger/gotham/directory.json
-#
-# Signature: the directory is signed by an Ed25519 authority key that
-# the app already trusts (your release-signing key, or — for personal
-# testnets — a key you generate once and ship in the source tree).
-#
-# For Option B (self-operated testnet) the authority IS you; generate it once:
-#   cargo run -p crypto-gotham-relay --bin gotham-relay -- keygen --key-file ~/.gotham-authority.key
-# Then export its pubkey hex and hardcode it in
-# `crypto-tauri/src-tauri/src/gotham.rs:DEFAULT_AUTHORITY_PUBKEY` (TODO).
 
 set -euo pipefail
 
@@ -75,16 +49,11 @@ done
     exit 1
 }
 
-# Build the unsigned directory JSON. The actual signing step needs a small
-# Rust helper because Ed25519 over the canonical JSON encoding has to
-# match what the Rust code expects. Punt to a cargo invocation.
-
 RELAYS_JSON=$(mktemp)
 {
     echo "["
     for i in "${!ENTRIES[@]}"; do
         IFS=':' read -r PUBKEY IP PORT <<< "${ENTRIES[$i]}"
-        # Validate
         [[ ${#PUBKEY} -eq 64 ]] || { echo "Bad pubkey length (need 64 hex chars): $PUBKEY" >&2; exit 1; }
         [[ "$IP" =~ ^[0-9.:a-f]+$ ]] || { echo "Bad IP: $IP" >&2; exit 1; }
         [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "Bad port: $PORT" >&2; exit 1; }
@@ -95,15 +64,12 @@ RELAYS_JSON=$(mktemp)
     echo "]"
 } > "$RELAYS_JSON"
 
-# Invoke the cargo helper to actually sign. The helper lives in
-# crypto-gotham-relay and uses the same Ed25519 + DirectoryDoc format
-# the app verifies on load.
 cargo run --quiet --package crypto-gotham-relay --bin gotham-relay -- \
     sign-directory \
     --authority-key "$AUTHORITY_KEY" \
     --relays "$RELAYS_JSON" \
     --output "$OUTPUT" \
-    --valid-secs 2592000   # 30 days
+    --valid-secs 2592000
 
 rm -f "$RELAYS_JSON"
 

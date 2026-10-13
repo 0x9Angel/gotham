@@ -1,31 +1,4 @@
 #!/usr/bin/env bash
-#
-# install-turn.sh — install + harden a coturn TURN server on a relay VM so the
-# Crypto app can place PRIVATE (relay-only) audio calls: neither peer learns the
-# other's IP, and no third-party STUN/TURN (e.g. Google) is contacted.
-#
-# It runs alongside a Gotham relay on the same host (different ports, no
-# conflict). It uses coturn's `use-auth-secret` (TURN REST) mechanism: the app
-# never holds a password — the directory authority signs SHORT-LIVED credentials
-# with the SAME shared secret this script installs (see `--turn-secret-file` /
-# `--turn-url` on gotham-directory-authority).
-#
-# HONEST NOTE: hosting TURN yourself does NOT make a call "anonymous" — it moves
-# the call metadata to THIS server. As the operator you can see both peers' IPs
-# and the call timing/duration (never the media, which stays DTLS-SRTP E2E
-# encrypted). It removes the third-party (Google) exposure and the peer-to-peer
-# IP leak; it is not mixnet-grade anonymity.
-#
-# Usage (Debian/Ubuntu, as root):
-#   TURN_REALM=relay.example.org \
-#   TLS_CERT=/etc/letsencrypt/live/relay.example.org/fullchain.pem \
-#   TLS_KEY=/etc/letsencrypt/live/relay.example.org/privkey.pem \
-#   ./install-turn.sh
-#
-# IP-only (no domain/cert): omit TURN_REALM/TLS_* — plain TURN on 3478 is used
-# (media still E2E encrypted; only the TURN signalling metadata isn't wrapped in
-# TLS). Env knobs: TURN_EXTERNAL_IP, TURN_SECRET, MIN_PORT, MAX_PORT,
-# SECRET_FILE, AUTHORITY_URL.
 
 set -euo pipefail
 
@@ -34,11 +7,10 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-# ── Config ───────────────────────────────────────────────────────────────────
 EXTERNAL_IP="${TURN_EXTERNAL_IP:-$(curl -fsS https://api.ipify.org 2>/dev/null || true)}"
 REALM="${TURN_REALM:-${EXTERNAL_IP:-gotham.local}}"
 MIN_PORT="${MIN_PORT:-49160}"
-MAX_PORT="${MAX_PORT:-49200}"          # small relay range = fewer open ports
+MAX_PORT="${MAX_PORT:-49200}"
 SECRET_FILE="${SECRET_FILE:-/etc/gotham-turn/secret}"
 TLS_CERT="${TLS_CERT:-}"
 TLS_KEY="${TLS_KEY:-}"
@@ -48,20 +20,15 @@ if [[ -z "${EXTERNAL_IP}" ]]; then
   exit 1
 fi
 
-# ── Shared secret (server-side only; the authority reads the same file) ───────
 mkdir -p "$(dirname "${SECRET_FILE}")"
 if [[ -n "${TURN_SECRET:-}" ]]; then
   printf '%s' "${TURN_SECRET}" > "${SECRET_FILE}"
 elif [[ ! -s "${SECRET_FILE}" ]]; then
-  # 32 random bytes, hex. Same string goes into coturn AND the authority.
   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "${SECRET_FILE}"
 fi
 chmod 600 "${SECRET_FILE}"
 SECRET="$(cat "${SECRET_FILE}")"
 
-# ── Which address can this machine actually bind? ────────────────────────────
-# The route to the internet tells us which interface (and therefore which
-# address) the kernel would use. On a cloud instance that is the private one.
 LOCAL_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
 if [[ -z "${LOCAL_IP}" ]]; then
   LOCAL_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -76,33 +43,17 @@ if [[ "${LOCAL_IP}" != "${EXTERNAL_IP}" ]]; then
   echo "▸ Behind 1:1 NAT: binding ${LOCAL_IP}, advertising ${EXTERNAL_IP}."
 fi
 
-# ── Install coturn ───────────────────────────────────────────────────────────
 echo "▸ Installing coturn…"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq coturn
 
-# ── Hardened config ──────────────────────────────────────────────────────────
 CONF=/etc/turnserver.conf
 echo "▸ Writing ${CONF}…"
 {
   echo "# Managed by install-turn.sh — Gotham private-call TURN. Do not hand-edit."
   echo "listening-port=3478"
   echo "listening-ip=0.0.0.0"
-  # relay-ip must be an address this machine ACTUALLY HOLDS.
-  #
-  # Every mainstream cloud (Oracle, Azure, GCP, AWS) puts the public address on
-  # a NAT in front of the instance: the interface only ever carries a private
-  # 10.x/172.16.x/192.168.x. Writing the PUBLIC address here makes coturn try to
-  # bind every port of its relay range to an address that does not exist
-  # locally, and it fails all of them with errno=99 (EADDRNOTAVAIL). The server
-  # still answers the first Allocate with a challenge, then goes silent — so it
-  # looks alive from outside while no allocation can ever succeed. No relay
-  # candidate is gathered, and with relay-only calls that means no candidate at
-  # all: the callee waits on "no candidate pairs" and the caller sits at zero.
-  #
-  # external-ip takes the PUBLIC/PRIVATE mapping so the addresses coturn
-  # advertises stay the reachable ones.
   echo "relay-ip=${LOCAL_IP}"
   if [[ "${LOCAL_IP}" == "${EXTERNAL_IP}" ]]; then
     echo "external-ip=${EXTERNAL_IP}"
@@ -171,14 +122,12 @@ echo "▸ Writing ${CONF}…"
 } > "${CONF}"
 chmod 640 "${CONF}"
 
-# Enable the service (Debian gates it behind this flag).
 sed -i 's/^#\?TURNSERVER_ENABLED=.*/TURNSERVER_ENABLED=1/' /etc/default/coturn 2>/dev/null || \
   echo "TURNSERVER_ENABLED=1" > /etc/default/coturn
 
 systemctl enable coturn >/dev/null 2>&1 || true
 systemctl restart coturn
 
-# ── Firewall hint (ufw) ──────────────────────────────────────────────────────
 if command -v ufw >/dev/null 2>&1; then
   echo "▸ Opening firewall ports (ufw)…"
   ufw allow 3478/udp comment 'gotham-turn' >/dev/null 2>&1 || true
@@ -187,7 +136,6 @@ if command -v ufw >/dev/null 2>&1; then
   ufw allow "${MIN_PORT}:${MAX_PORT}/udp" comment 'gotham-turn-relay' >/dev/null 2>&1 || true
 fi
 
-# ── Report ───────────────────────────────────────────────────────────────────
 if [[ -n "${TLS_CERT}" ]]; then
   TURN_URL="turns:${REALM}:5349"
 else

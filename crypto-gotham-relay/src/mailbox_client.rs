@@ -1,21 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial
 // Copyright (C) 2026 0x9Angel.
 
-//! Client for the Gotham store-and-forward mailbox control protocol.
-//!
-//! Opens a **direct** QUIC + Noise XK connection to a mailbox-hosting relay
-//! (ALPN `gotham-mbx/1`, the relay's X25519 identity pinned from the signed
-//! directory) and issues deposit / fetch requests.
-//!
-//! This is deliberately a direct connection, NOT a mixnet path: a
-//! store-and-forward *fetch* needs a reply, and a one-way mixnet cannot route a
-//! reply back anonymously (that needs single-use reply blocks — future work).
-//! The consequence is that the chosen mailbox host learns
-//! `client-IP ↔ mailbox_id` — the same metadata a store-and-forward server sees
-//! in Signal. The end-to-end content stays sealed + Double-Ratcheted; the
-//! mailbox only ever holds opaque ciphertext. The tradeoff and its hardening
-//! path are documented in `docs/gotham/README.md`.
-
 use std::net::SocketAddr;
 
 use crypto_gotham::mailbox::{
@@ -31,12 +16,6 @@ use crate::transport::{
     write_noise_blob, TransportError,
 };
 
-/// A client for depositing to / fetching from a mailbox-hosting relay.
-///
-/// Holds one QUIC client endpoint (reusable across calls) and an ephemeral
-/// clamped X25519 key used only as the Noise XK initiator identity (the client
-/// is not authenticated at the Noise layer — Gotham's anonymity model). The
-/// key is zeroized on drop.
 #[derive(ZeroizeOnDrop)]
 pub struct MailboxClient {
     #[zeroize(skip)]
@@ -45,7 +24,6 @@ pub struct MailboxClient {
 }
 
 impl MailboxClient {
-    /// Construct a client with a freshly-generated ephemeral X25519 identity.
     pub fn new<R: CryptoRng + RngCore>(rng: &mut R) -> Result<Self, TransportError> {
         let mut sk = [0u8; 32];
         rng.fill_bytes(&mut sk);
@@ -58,9 +36,6 @@ impl MailboxClient {
         })
     }
 
-    /// Open a QUIC + Noise XK session to a mailbox relay, pinning `relay_pk`.
-    /// Also returns the Noise handshake hash, used as the channel binding for
-    /// the SEC-MBX-01 fetch possession proof.
     async fn open(
         &self,
         relay_addr: SocketAddr,
@@ -80,9 +55,6 @@ impl MailboxClient {
         Ok((conn, send, recv, noise, binding))
     }
 
-    /// Deposit `sealed` for `mailbox_id`, expiring after `ttl_secs`
-    /// (`0` ⇒ the relay's policy default). Returns `Ok(())` once the relay has
-    /// acknowledged the store.
     pub async fn deposit(
         &self,
         relay_addr: SocketAddr,
@@ -109,14 +81,6 @@ impl MailboxClient {
         }
     }
 
-    /// Fetch ALL pending sealed envelopes for `mailbox_id`, looping over the
-    /// relay's bounded batches until the mailbox is drained. Returns the
-    /// envelopes in deposit (FIFO) order.
-    ///
-    /// `identity_sk` is the caller's **Gotham identity secret key** — the one
-    /// whose public half derives `mailbox_id`. A fetch is destructive, so the
-    /// relay requires proof that we hold it (SEC-MBX-01); passing a key that
-    /// does not own `mailbox_id` yields [`MailboxWireError::Unauthorized`].
     pub async fn fetch_all(
         &self,
         relay_addr: SocketAddr,
@@ -126,21 +90,11 @@ impl MailboxClient {
     ) -> Result<Vec<Vec<u8>>, MailboxClientError> {
         let (conn, mut send, mut recv, mut noise, binding) =
             self.open(relay_addr, relay_pk).await?;
-        // Possession proof, bound to THIS Noise session's handshake hash so a
-        // captured tag cannot be replayed on another connection. Computed once:
-        // every round of the drain loop reuses the same binding.
         let auth = fetch_auth_for(identity_sk, relay_pk, &binding, &mailbox_id);
         let mut all: Vec<Vec<u8>> = Vec::new();
         let mut rounds = 0usize;
         let mut total_bytes = 0usize;
         let result = loop {
-            // The loop is driven by a flag the RELAY controls, so it must be
-            // bounded on OUR side. The Noise channel authenticates the relay's
-            // key, not its honesty: a hostile or compromised mailbox host can
-            // answer every round with `more = true` forever. Unbounded, that
-            // grows `all` without limit (OOM) and — because poll_mailbox is
-            // awaited inline in the background poller's select! — permanently
-            // starves presence, outbox retries and the auto-lock timer.
             rounds += 1;
             if rounds > MAX_FETCH_ROUNDS {
                 tracing::warn!(
@@ -163,9 +117,6 @@ impl MailboxClient {
             };
             match resp {
                 MailboxResponse::Delivery { sealed, more } => {
-                    // Forward progress: an honest relay never claims there is
-                    // more to come without handing over at least one message.
-                    // Mirrors the server-side guard in `transport.rs`.
                     if more && sealed.is_empty() {
                         tracing::warn!("mailbox host claimed more messages but sent none");
                         break Err(MailboxClientError::Unexpected);
@@ -191,13 +142,6 @@ impl MailboxClient {
     }
 }
 
-/// Build a [`FetchAuth`] possession proof for `mailbox_id`.
-///
-/// `identity_sk` must be the secret half of the key that derives `mailbox_id`;
-/// `relay_pk` is the mailbox host's pinned static key, and `binding` is the
-/// transport context the tag is scoped to (the Noise handshake hash on the
-/// direct path, [`crypto_gotham::mailbox::surb_fetch_binding`] on the mixnet
-/// path). Shared by the direct fetch here and the SURB fetch the app builds.
 #[must_use]
 pub fn fetch_auth_for(
     identity_sk: &[u8; 32],
@@ -212,26 +156,15 @@ pub fn fetch_auth_for(
     }
 }
 
-/// Hard ceilings for [`MailboxClient::fetch_all`], which loops on a `more` flag
-/// the RELAY controls. An honest host drains at most `max_msgs_per_mailbox`
-/// (256) messages of `max_msg_bytes` (256 KiB) in bounded batches, so these
-/// leave generous headroom while still stopping a hostile host that never
-/// signals completion.
 const MAX_FETCH_ROUNDS: usize = 64;
-/// 96 MiB: comfortably above a full honest mailbox (256 x 256 KiB = 64 MiB),
-/// far below what would exhaust memory.
 const MAX_FETCH_TOTAL_BYTES: usize = 96 * 1024 * 1024;
 
-/// Errors from the mailbox client pipeline.
 #[derive(Debug, thiserror::Error)]
 pub enum MailboxClientError {
-    /// Underlying QUIC + Noise transport error.
     #[error("transport: {0}")]
     Transport(#[from] TransportError),
-    /// The relay refused the request (capacity, size, malformed).
     #[error("mailbox refused: {0:?}")]
     Wire(MailboxWireError),
-    /// The relay returned a response that doesn't match the request kind.
     #[error("unexpected mailbox response")]
     Unexpected,
 }
@@ -266,7 +199,6 @@ mod tests {
         sk
     }
 
-    /// Spawn a mailbox-hosting relay on 127.0.0.1:0; return (addr, pk, store).
     async fn spawn_mailbox_relay(
         sk: [u8; 32],
         policy: MailboxPolicy,
@@ -292,14 +224,12 @@ mod tests {
         let (addr, relay_pk, _store) =
             spawn_mailbox_relay(relay_sk, MailboxPolicy::default()).await;
 
-        // Recipient B's mailbox address (opaque hash of B's pubkey).
         let recipient_pk = clamped_sk(&mut rng);
         let recipient_pub = PublicKey::from(&StaticSecret::from(recipient_pk)).to_bytes();
         let mbid = mailbox_id_for(&recipient_pub);
 
         let client = MailboxClient::new(&mut rng).unwrap();
 
-        // Depositor stores two sealed blobs (opaque to the relay).
         client
             .deposit(addr, &relay_pk, mbid, b"sealed-one".to_vec(), 3600)
             .await
@@ -309,9 +239,6 @@ mod tests {
             .await
             .expect("deposit 2");
 
-        // Recipient fetches — gets both, FIFO, and draining leaves it empty.
-        // The fetch carries the SEC-MBX-01 possession proof over `recipient_pk`
-        // (the secret half); without it the relay refuses.
         let got = client
             .fetch_all(addr, &relay_pk, mbid, &recipient_pk)
             .await
@@ -328,8 +255,6 @@ mod tests {
     async fn fetch_all_loops_over_batches() {
         let mut rng = ChaCha20Rng::seed_from_u64(0xB00C);
         let relay_sk = clamped_sk(&mut rng);
-        // Small per-message cap but many messages, so several fit one budget;
-        // deposit 40 and confirm fetch_all returns every one across batches.
         let (addr, relay_pk, _store) =
             spawn_mailbox_relay(relay_sk, MailboxPolicy::default()).await;
         let owner_sk = clamped_sk(&mut rng);
@@ -351,10 +276,6 @@ mod tests {
         assert_eq!(got[39], vec![39u8; 100]);
     }
 
-    /// End-to-end analogue of the Tauri offline path: the sender seals an
-    /// envelope for the recipient and deposits it; the (previously offline)
-    /// recipient reconnects, fetches, and unseals it with its identity secret —
-    /// recovering the exact `(sender_pk, body)` the live mixnet path yields.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sealed_envelope_survives_deposit_and_fetch_for_offline_peer() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x005E_A1ED);
@@ -363,7 +284,7 @@ mod tests {
 
         let recipient_sk = clamped_sk(&mut rng);
         let recipient_pk = PublicKey::from(&StaticSecret::from(recipient_sk)).to_bytes();
-        let sender_pk = clamped_sk(&mut rng); // apparent sender identity
+        let sender_pk = clamped_sk(&mut rng);
 
         let body = b"offline message body (a ratchet ciphertext in production)";
         let sealed =
@@ -376,7 +297,6 @@ mod tests {
             .await
             .expect("deposit while recipient offline");
 
-        // Recipient reconnects, drains, and unseals.
         let got = client
             .fetch_all(addr, &relay_pk, mbid, &recipient_sk)
             .await
@@ -388,11 +308,6 @@ mod tests {
         assert_eq!(unsealed_body, body, "body recovered intact");
     }
 
-    /// End-to-end A2 (anonymous deposit): the sender routes a deposit OVER THE
-    /// MIXNET to the recipient's mailbox host (so the host never sees the
-    /// sender's IP), the host's delivery handler stores it, and the recipient
-    /// fetches + unseals it. Proves the full `send_sealed_to_exit` →
-    /// `make_mailbox_deposit_handler` → mailbox → `fetch_all` path.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn mixnet_deposit_lands_in_mailbox_then_fetches_back() {
         use crate::process::Relay;
@@ -422,7 +337,6 @@ mod tests {
             }
         };
 
-        // Entry + mix: plain forwarders.
         let sk_entry = clamped_sk(&mut rng);
         let sk_mix = clamped_sk(&mut rng);
         let entry_ep = build_server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -448,7 +362,6 @@ mod tests {
             .await;
         });
 
-        // Mailbox host: mixnet deposit handler + mailbox-control endpoint, one store.
         let sk_host = clamped_sk(&mut rng);
         let host_pk = PublicKey::from(&StaticSecret::from(sk_host)).to_bytes();
         let host_ep = build_server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -469,7 +382,6 @@ mod tests {
             .await;
         });
 
-        // Recipient identity (offline) + sender identity.
         let recipient_sk = clamped_sk(&mut rng);
         let recipient_pub = PublicKey::from(&StaticSecret::from(recipient_sk)).to_bytes();
         let sender_pk = clamped_sk(&mut rng);
@@ -481,8 +393,6 @@ mod tests {
         ];
         let host_desc = relays[2].clone();
 
-        // Sender seals the message for the recipient, wraps it in a Deposit, and
-        // routes it to the host over the mixnet (the host never sees sender IP).
         let inner =
             crypto_gotham::sealed::seal(&mut rng, &recipient_pub, &sender_pk, b"offline hi")
                 .unwrap();
@@ -501,7 +411,6 @@ mod tests {
             .await
             .expect("mixnet deposit send");
 
-        // Recipient reconnects and fetches (retry until the async deposit lands).
         let fetcher = MailboxClient::new(&mut rng).unwrap();
         let mut got = Vec::new();
         for _ in 0..30 {
@@ -551,15 +460,6 @@ mod tests {
         ));
     }
 
-    /// SEC-MBX-01 regression. The attack: a mailbox address is
-    /// `blake3(domain || recipient_pubkey)` over a PUBLIC key, and a fetch is
-    /// DESTRUCTIVE. Anyone ever handed a victim's Gotham public key — every
-    /// contact, anyone with an invitation URI — could address their mailbox and
-    /// drain it, silently deleting messages the victim never learns existed.
-    ///
-    /// Here the attacker knows the victim's public key exactly (it computes the
-    /// same mailbox id) but not the secret. The relay must refuse it, and the
-    /// victim's messages must still be there afterwards.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_public_key_alone_cannot_drain_someone_elses_mailbox() {
         let mut rng = ChaCha20Rng::seed_from_u64(0xDEAD_BEEF);
@@ -577,8 +477,6 @@ mod tests {
             .await
             .expect("deposit");
 
-        // The attacker holds the victim's PUBLIC key — enough to compute mbid —
-        // but signs the proof with its own unrelated secret.
         let attacker_sk = clamped_sk(&mut rng);
         assert_eq!(
             mailbox_id_for(&victim_pk),
@@ -597,7 +495,6 @@ mod tests {
             "expected Unauthorized, got {err:?}"
         );
 
-        // The message survived: the drain never happened.
         let got = client
             .fetch_all(addr, &relay_pk, mbid, &victim_sk)
             .await
@@ -609,9 +506,6 @@ mod tests {
         );
     }
 
-    /// A proof is scoped to ONE connection. Replaying a tag captured from an
-    /// earlier session must fail, because the channel binding is that session's
-    /// Noise handshake hash.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_captured_proof_cannot_be_replayed_on_another_connection() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x5EA1_5EA1);
@@ -628,8 +522,6 @@ mod tests {
             .await
             .expect("deposit");
 
-        // A tag built over a DIFFERENT binding — exactly what an attacker who
-        // sniffed one session's proof would be replaying into a new one.
         let stale = fetch_auth_for(&victim_sk, &relay_pk, b"some other session", &mbid);
         let (conn, mut send, mut recv, mut noise, _binding) =
             client.open(addr, &relay_pk).await.expect("open");

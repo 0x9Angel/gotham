@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# uninstall-relay-macos.sh — remove a Gotham mixnet relay installed by
-# install-relay-macos.sh (launchd LaunchDaemon + /usr/local files).
-#
-#   curl -fsSL https://raw.githubusercontent.com/0x9Angel/gotham-relay/main/infra/scripts/uninstall-relay-macos.sh | sudo bash
-#
-# Default removes everything, including the identity key (a reinstall gets a
-# NEW public key). Keep the key for a same-identity reinstall with:
-#   GOTHAM_KEEP_KEYS=1 ... | sudo -E bash
 set -euo pipefail
 
 KEEP_KEYS="${GOTHAM_KEEP_KEYS:-0}"
