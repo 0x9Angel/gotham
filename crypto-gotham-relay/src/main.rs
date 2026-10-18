@@ -868,6 +868,8 @@ async fn main() -> std::io::Result<()> {
                 .as_deref()
                 .and_then(|h| hex::decode(h).ok())
                 .and_then(|v| <[u8; 32]>::try_from(v).ok());
+            let rendezvous_queriers =
+                crypto_gotham_relay::transport::querier_keys(authority_pop_pk);
 
             if let Some(url) = authority_url {
                 let advertise = if rendezvous_key.is_some() {
@@ -925,6 +927,7 @@ async fn main() -> std::io::Result<()> {
                     mailbox,
                     relay_sk: sk,
                     authority_pop_pk,
+                    pop_key_sink: rendezvous_capable.then(|| rendezvous_queriers.clone()),
                 };
                 info!("auto-enrollment enabled — announcing to directory authority");
                 let watch_urls: Vec<String> = std::iter::once(cfg.authority_url.clone())
@@ -1032,7 +1035,7 @@ async fn main() -> std::io::Result<()> {
                         info!(%listen_addr, "binding QUIC listener");
                         crypto_gotham_relay::run_relay_listener_with_services_shared(
                             listen_addr, sk, Arc::clone(&relay), mailbox_delivery,
-                            mailbox_handle.clone(), gossip_service, authority_pop_pk,
+                            mailbox_handle.clone(), gossip_service, Some(rendezvous_queriers.clone()),
                         )
                         .await
                     }

@@ -23,6 +23,7 @@ pub struct EnrollConfig {
     pub mailbox: bool,
     pub relay_sk: [u8; 32],
     pub authority_pop_pk: Option<[u8; 32]>,
+    pub pop_key_sink: Option<crate::transport::QuerierKeys>,
 }
 
 fn now_unix() -> u64 {
@@ -155,6 +156,9 @@ pub async fn run_enrollment_loop(cfg: EnrollConfig) {
             if t.pop_pk.is_none() {
                 t.pop_pk = fetch_authority_pop_pk(&client, &t.base_url).await;
             }
+            if let (Some(pk), Some(sink)) = (t.pop_pk, cfg.pop_key_sink.as_ref()) {
+                crate::transport::add_querier_key(sink, pk);
+            }
 
             let enrollment = match t.pop_pk {
                 Some(pk) => attach_pop_proof(base.clone(), &cfg, pk, seq),
@@ -242,6 +246,7 @@ mod tests {
             mailbox: false,
             relay_sk: [9u8; 32],
             authority_pop_pk: None,
+            pop_key_sink: None,
         }
     }
 

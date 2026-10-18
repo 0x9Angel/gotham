@@ -499,19 +499,48 @@ pub async fn noise_ik_initiator_handshake(
     Ok(transport)
 }
 
+pub type QuerierKeys = Arc<std::sync::RwLock<Vec<[u8; 32]>>>;
+
+pub const MAX_QUERIER_KEYS: usize = 16;
+
+pub fn querier_keys(pinned: Option<[u8; 32]>) -> QuerierKeys {
+    Arc::new(std::sync::RwLock::new(pinned.into_iter().collect()))
+}
+
+pub fn add_querier_key(keys: &QuerierKeys, pk: [u8; 32]) {
+    let mut held = match keys.write() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if held.contains(&pk) {
+        return;
+    }
+    if held.len() >= MAX_QUERIER_KEYS {
+        held.remove(0);
+    }
+    held.push(pk);
+}
+
+fn querier_known(keys: &QuerierKeys, pk: &[u8; 32]) -> bool {
+    match keys.read() {
+        Ok(g) => g.contains(pk),
+        Err(poisoned) => poisoned.into_inner().contains(pk),
+    }
+}
+
 pub async fn serve_rendezvous_query(
     conn: quinn::Connection,
     static_sk: [u8; 32],
-    authority_pop_pk: Option<[u8; 32]>,
+    queriers: Option<QuerierKeys>,
     table: crate::rendezvous::RendezvousTable,
 ) -> Result<(), TransportError> {
-    let Some(expected) = authority_pop_pk else {
+    let Some(queriers) = queriers else {
         return Err(TransportError::BadHandshake);
     };
     let (mut send, mut recv) = conn.accept_bi().await?;
     let (mut noise, querier_pk) =
         noise_ik_responder_handshake(&static_sk, &mut send, &mut recv).await?;
-    if querier_pk != expected {
+    if !querier_known(&queriers, &querier_pk) {
         return Err(TransportError::BadHandshake);
     }
     let mut buf = Vec::new();
@@ -1078,7 +1107,7 @@ pub async fn run_relay_listener_with_services(
     delivery: Option<DeliveryHandler>,
     mailbox: Option<Arc<Mutex<Mailbox>>>,
     gossip: Option<GossipService>,
-    authority_pop_pk: Option<[u8; 32]>,
+    rendezvous_queriers: Option<QuerierKeys>,
 ) -> Result<(), TransportError> {
     run_relay_listener_with_services_shared(
         listen_addr,
@@ -1087,7 +1116,7 @@ pub async fn run_relay_listener_with_services(
         delivery,
         mailbox,
         gossip,
-        authority_pop_pk,
+        rendezvous_queriers,
     )
     .await
 }
@@ -1099,7 +1128,7 @@ pub async fn run_relay_listener_with_services_shared(
     delivery: Option<DeliveryHandler>,
     mailbox: Option<Arc<Mutex<Mailbox>>>,
     gossip: Option<GossipService>,
-    authority_pop_pk: Option<[u8; 32]>,
+    rendezvous_queriers: Option<QuerierKeys>,
 ) -> Result<(), TransportError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let server = build_server_endpoint(listen_addr)?;
@@ -1110,7 +1139,7 @@ pub async fn run_relay_listener_with_services_shared(
         delivery,
         mailbox,
         gossip,
-        authority_pop_pk,
+        rendezvous_queriers,
     )
     .await
 }
@@ -1147,7 +1176,7 @@ pub async fn serve_endpoint_with_services(
     delivery: Option<DeliveryHandler>,
     mailbox: Option<Arc<Mutex<Mailbox>>>,
     gossip: Option<GossipService>,
-    authority_pop_pk: Option<[u8; 32]>,
+    rendezvous_queriers: Option<QuerierKeys>,
 ) -> Result<(), TransportError> {
     serve_endpoint_with_services_shared(
         endpoint,
@@ -1156,7 +1185,7 @@ pub async fn serve_endpoint_with_services(
         delivery,
         mailbox,
         gossip,
-        authority_pop_pk,
+        rendezvous_queriers,
     )
     .await
 }
@@ -1168,7 +1197,7 @@ pub async fn serve_endpoint_with_services_shared(
     delivery: Option<DeliveryHandler>,
     mailbox: Option<Arc<Mutex<Mailbox>>>,
     gossip: Option<GossipService>,
-    authority_pop_pk: Option<[u8; 32]>,
+    rendezvous_queriers: Option<QuerierKeys>,
 ) -> Result<(), TransportError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let client = build_client_endpoint()?;
@@ -1200,6 +1229,7 @@ pub async fn serve_endpoint_with_services_shared(
         let delivery = delivery.clone();
         let mailbox = mailbox.clone();
         let gossip = gossip.clone();
+        let rendezvous_queriers = rendezvous_queriers.clone();
         tokio::spawn(async move {
             let _permit = permit;
             match connecting.await {
@@ -1247,7 +1277,7 @@ pub async fn serve_endpoint_with_services_shared(
                             if let Err(e) = serve_rendezvous_query(
                                 conn,
                                 sk,
-                                authority_pop_pk,
+                                rendezvous_queriers,
                                 pool.rendezvous().clone(),
                             )
                             .await
@@ -1457,7 +1487,13 @@ mod tests {
                 let table = serve_table.clone();
                 tokio::spawn(async move {
                     if let Ok(conn) = connecting.await {
-                        let _ = serve_rendezvous_query(conn, r_sk, Some(auth_pk), table).await;
+                        let _ = serve_rendezvous_query(
+                            conn,
+                            r_sk,
+                            Some(querier_keys(Some(auth_pk))),
+                            table,
+                        )
+                        .await;
                     }
                 });
             }
@@ -1488,6 +1524,87 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn every_authority_the_rendezvous_point_knows_gets_an_answer() {
+        init_crypto_provider();
+        let mut r = rng();
+        let mut key = || {
+            let mut sk = [0u8; 32];
+            r.fill_bytes(&mut sk);
+            (sk, PublicKey::from(&StaticSecret::from(sk)).to_bytes())
+        };
+        let (r_sk, r_pk) = key();
+        let (a1_sk, a1_pk) = key();
+        let (a2_sk, a2_pk) = key();
+        let (a3_sk, a3_pk) = key();
+        let (imp_sk, _) = key();
+        let (_, n_pk) = key();
+
+        let queriers = querier_keys(Some(a1_pk));
+        add_querier_key(&queriers, a2_pk);
+
+        let server = build_server_endpoint("127.0.0.1:0".parse().unwrap()).unwrap();
+        let bound = server.local_addr().unwrap();
+        let serve_table = crate::rendezvous::RendezvousTable::new();
+        let served = queriers.clone();
+        let handle = tokio::spawn(async move {
+            while let Some(connecting) = server.accept().await {
+                let table = serve_table.clone();
+                let keys = served.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = connecting.await {
+                        let _ = serve_rendezvous_query(conn, r_sk, Some(keys), table).await;
+                    }
+                });
+            }
+        });
+
+        let ask = |sk: [u8; 32]| async move {
+            probe_rendezvous_hosting(bound, &r_pk, &sk, &n_pk, std::time::Duration::from_secs(5))
+                .await
+        };
+        assert!(
+            ask(a1_sk).await.is_ok(),
+            "the first authority must get an answer"
+        );
+        assert!(
+            ask(a2_sk).await.is_ok(),
+            "the second authority must get an answer"
+        );
+        assert!(
+            ask(imp_sk).await.is_err(),
+            "an unknown querier must be refused"
+        );
+        assert!(
+            ask(a3_sk).await.is_err(),
+            "a third authority is refused until its key is learned"
+        );
+        add_querier_key(&queriers, a3_pk);
+        assert!(
+            ask(a3_sk).await.is_ok(),
+            "a key learned later is accepted without a restart"
+        );
+
+        handle.abort();
+    }
+
+    #[test]
+    fn querier_keys_are_deduplicated_and_bounded() {
+        let keys = querier_keys(None);
+        add_querier_key(&keys, [1u8; 32]);
+        add_querier_key(&keys, [1u8; 32]);
+        assert_eq!(keys.read().unwrap().len(), 1);
+        for i in 0..(MAX_QUERIER_KEYS as u8 + 4) {
+            add_querier_key(&keys, [i.wrapping_add(2); 32]);
+        }
+        let held = keys.read().unwrap();
+        assert_eq!(held.len(), MAX_QUERIER_KEYS);
+        assert!(
+            !held.contains(&[1u8; 32]),
+            "the oldest key goes first once the bound is reached"
+        );
     }
 
     async fn spawn_relay_with_delivery(
