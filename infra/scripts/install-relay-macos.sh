@@ -37,6 +37,10 @@ fi
     echo "    (got '$OPERATOR')"
     exit 1
 }
+[[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( PORT >= 1 && PORT <= 65535 )) || {
+    echo "[!] GOTHAM_PORT must be a number from 1 to 65535 (got '$PORT')"
+    exit 1
+}
 
 case "$(uname -m)" in
   arm64)  ASSET=gotham-relay-macos-aarch64 ;;
@@ -94,13 +98,17 @@ elif [[ -n "${GOTHAM_ADVERTISE_IP:-}" ]]; then
     ADVERTISE_XML="    <string>--advertise-addr</string><string>${GOTHAM_ADVERTISE_IP}:$PORT</string>"
     ADVERTISE_MSG="${GOTHAM_ADVERTISE_IP}:$PORT (manual)"
 else
-    ADVERTISE_XML="    <!-- no --advertise-addr: the relay auto-maps its UDP port and detects its public IP via UPnP-IGD -->"
+    ADVERTISE_XML=""
     ADVERTISE_MSG="auto (UPnP-IGD)"
 fi
 if [[ -n "$ENROLL_TOKEN" ]]; then
-    TOKEN_XML="    <string>--enroll-token</string><string>$ENROLL_TOKEN</string>"
+    TOKEN_ENV_XML="  <key>EnvironmentVariables</key><dict>
+    <key>GOTHAM_ENROLL_TOKEN</key><string>$ENROLL_TOKEN</string>
+  </dict>"
+    PLIST_MODE=600
 else
-    TOKEN_XML="    <!-- open enrollment: no --enroll-token needed -->"
+    TOKEN_ENV_XML=""
+    PLIST_MODE=644
 fi
 
 AUTHORITIES_XML=""
@@ -122,21 +130,18 @@ cat > "$PLIST" <<PLIST
     <string>--authority-url</string><string>$AUTHORITY_URL</string>
 ${AUTHORITIES_XML}    <string>--operator</string><string>$OPERATOR</string>
 $ADVERTISE_XML
-$TOKEN_XML
     <string>--tier</string><string>$TIER</string>
     <string>--heartbeat-secs</string><string>60</string>
-    <!-- F-25: keep the replay cache across restarts. Without it a restart
-         forgets every packet this relay has seen, and a packet captured
-         beforehand and replayed after is accepted as new. -->
     <string>--replay-cache-path</string><string>$STATE_DIR/replay.bin</string>
   </array>
+$TOKEN_ENV_XML
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>$LOG</string>
   <key>StandardErrorPath</key><string>$LOG</string>
 </dict></plist>
 PLIST
-chmod 644 "$PLIST"; chown root:wheel "$PLIST"
+chmod "$PLIST_MODE" "$PLIST"; chown root:wheel "$PLIST"
 
 echo "[4/5] Loading service…"
 launchctl bootout system "$PLIST" 2>/dev/null || true

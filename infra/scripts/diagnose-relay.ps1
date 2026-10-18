@@ -1,4 +1,3 @@
-
 $ErrorActionPreference = "Continue"
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -41,25 +40,59 @@ Write-Host "===== RELAY OUTPUT =====" -ForegroundColor Cyan
 if ($text) { Write-Host $text } else { Write-Host "(no output captured)" }
 Write-Host "$exit"
 Write-Host "===== VERDICT =====" -ForegroundColor Cyan
-if ($text -match "enrolled|directory updated|announced|enroll ok|enrol.*success") {
-    Write-Host "[OK] The relay reached the authority and ENROLLED — you're in the network." -ForegroundColor Green
+$pubkey = if ($text -match "identity public key: ([0-9a-f]{64})") { $Matches[1] } else { $null }
+$viaRendezvous = $argStr -match "--rendezvous-key"
+$auths = @([regex]::Matches($argStr, '--(?:extra-)?authority-url\s+(\S+)') | ForEach-Object { $_.Groups[1].Value })
+$listed = 0
+if ($pubkey) {
+    foreach ($a in $auths) {
+        try {
+            $body = (Invoke-WebRequest -Uri "$a/directory" -TimeoutSec 8 -UseBasicParsing).Content
+            if ($body -match $pubkey) { $listed++ }
+        } catch { }
+    }
 }
-elseif ($text -match "probe|liveness|not reachable|unreachable|proof.of.presence|rejected|timeout|4[0-9][0-9] ") {
-    Write-Host "[FIX] Your enrollment reached the authority, but it could NOT reach you back on the advertised UDP port." -ForegroundColor Yellow
-    Write-Host "      => On your router, FORWARD the UDP port shown in RELAY OUTPUT to THIS PC's LAN IP, then wait ~1 min."
-    Write-Host "      (If you're on a mobile hotspot / 4G-5G / shared connection, that's CGNAT — you cannot host a relay this way.)"
+if ($text -match "error: (unexpected argument|invalid value|a value is required)") {
+    Write-Host "[FIX] The relay rejected its own settings and stopped. Re-run the latest installer: it rewrites the task." -ForegroundColor Yellow
+}
+elseif ($text -match "enrolled with directory authority") {
+    if ($listed -ge 2) {
+        Write-Host "[OK] Enrolled and published by $listed authorities: clients can route through this relay." -ForegroundColor Green
+    } else {
+        Write-Host "[INFO] Enrolled, but published by only $listed of $($auths.Count) authorities." -ForegroundColor Yellow
+        Write-Host "      Each operator can have at most 5 published relays, and each network 3 per /24 and 8 per /16."
+        Write-Host "      If your operator name already has 5 relays, this one is accepted but stays unpublished."
+        Write-Host "      If the installer said 0 authorities while this test enrolls, the background task lacks the"
+        Write-Host "      enrollment token: re-run the latest installer with `$env:GOTHAM_ENROLL_TOKEN set."
+    }
+}
+elseif ($text -match "missing or invalid enroll token") {
+    Write-Host "[FIX] The authorities refused the enrollment token. Ask the network operator for it, then re-run" -ForegroundColor Yellow
+    Write-Host "      the installer with `$env:GOTHAM_ENROLL_TOKEN set."
+}
+elseif ($text -match "rendezvous liveness query failed|rendezvous relay does not host|rendezvous relay not found" -or
+        ($viaRendezvous -and $text -match "enroll rejected")) {
+    Write-Host "[SERVER] The rendezvous point did not confirm this relay to the authorities. This is on the network" -ForegroundColor Yellow
+    Write-Host "      side, not yours. Until the operator updates the rendezvous relays, use direct mode: forward a UDP"
+    Write-Host "      port on your router to this PC, then re-run the installer with `$env:GOTHAM_RENDEZVOUS='off'."
+}
+elseif ($text -match "liveness/proof-of-possession probe failed|not reachable|unreachable|timed out") {
+    Write-Host "[FIX] The authorities could not reach this relay on its advertised UDP port." -ForegroundColor Yellow
+    Write-Host "      => On your router, FORWARD that UDP port to THIS PC's LAN IP, then wait ~1 min."
+    Write-Host "      Some boxes only allow ports above 32768: pick one, forward it, re-run with `$env:GOTHAM_PORT."
+    Write-Host "      Behind a mobile hotspot / 4G-5G / CGNAT, no port can be forwarded: that connection cannot host a relay."
 }
 elseif ($text -match "UPnP|IGD") {
-    Write-Host "[FIX] UPnP failure — reinstall (the latest installer auto-detects your public IP), or set GOTHAM_ADVERTISE_IP." -ForegroundColor Yellow
+    Write-Host "[FIX] UPnP failure: reinstall (the installer detects your public IP), or set GOTHAM_ADVERTISE_IP." -ForegroundColor Yellow
 }
 elseif ($text -match "bind|in use|10048|10013|os error 100") {
-    Write-Host "[FIX] Cannot bind the UDP port (in use or blocked). Reinstall with GOTHAM_PORT=9101." -ForegroundColor Yellow
+    Write-Host "[FIX] Cannot bind the UDP port (in use or blocked). Reinstall with another GOTHAM_PORT." -ForegroundColor Yellow
 }
 elseif ($text -match "connect|refused|dns|resolve|failed to reach") {
     Write-Host "[?] The relay could not reach the authority. Check outbound internet / the authority URL." -ForegroundColor Yellow
 }
 else {
-    Write-Host "[?] Could not auto-classify — copy the RELAY OUTPUT above and send it to the operator." -ForegroundColor Yellow
+    Write-Host "[?] Could not auto-classify: copy the RELAY OUTPUT above and send it to the operator." -ForegroundColor Yellow
 }
 
 Write-Host ""

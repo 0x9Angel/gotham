@@ -35,6 +35,9 @@ apart from everyone else's.
 if ($Operator -notmatch '^[A-Za-z0-9._-]{1,32}$') {
     throw "GOTHAM_OPERATOR must be 1 to 32 characters from A-Z a-z 0-9 . _ - (got '$Operator')"
 }
+if ($Port -notmatch '^[0-9]{1,5}$' -or [int]$Port -lt 1 -or [int]$Port -gt 65535) {
+    throw "GOTHAM_PORT must be a number from 1 to 65535 (got '$Port')"
+}
 
 $Dir = Join-Path $env:ProgramData "Gotham"
 $Bin = Join-Path $Dir "gotham-relay.exe"
@@ -42,6 +45,11 @@ $Key = Join-Path $Dir "relay.key"
 New-Item -ItemType Directory -Force -Path $Dir | Out-Null
 
 Write-Host "[1/6] Downloading + verifying binary..."
+Stop-ScheduledTask -TaskName "GothamRelay" -ErrorAction SilentlyContinue
+Get-Process -Name "gotham-relay" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -eq $Bin } |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
 $Asset = "gotham-relay-windows-x86_64.exe"
 $Base  = "https://github.com/$Repo/releases/latest/download"
 Invoke-WebRequest -Uri "$Base/$Asset"        -OutFile $Bin
@@ -80,8 +88,8 @@ if ($Rdv -in @("on", "1", "true")) {
 
 if ($Mode -eq "rendezvous") {
     Write-Host "    No reachable public address - enrolling via a RENDEZVOUS point (RFC B3, works behind CGNAT/4G-5G)."
-    try   { $dir = Invoke-RestMethod -Uri "$AuthUrl/directory" -TimeoutSec 10 } catch { $dir = $null }
-    $rp = if ($dir) { $dir.doc.relays | Where-Object { $_.rendezvous_capable } | Select-Object -First 1 } else { $null }
+    try   { $DirDoc = Invoke-RestMethod -Uri "$AuthUrl/directory" -TimeoutSec 10 } catch { $DirDoc = $null }
+    $rp = if ($DirDoc) { $DirDoc.doc.relays | Where-Object { $_.rendezvous_capable } | Select-Object -First 1 } else { $null }
     if (-not $rp) {
         throw "No rendezvous point available from $AuthUrl. An operator must run a public relay with --rendezvous-capable, or set `$env:GOTHAM_ADVERTISE_IP='<reachable.ip>' if you can port-forward UDP $Port."
     }
@@ -109,7 +117,13 @@ if ($Mode -eq "rendezvous") {
     $AdvMsg = "$($AdvIp):$Port"
 }
 
-if ($Token) { [Environment]::SetEnvironmentVariable("GOTHAM_ENROLL_TOKEN", $Token, "Machine") }
+if ($Token) {
+    if ($Token -notmatch '^[A-Za-z0-9._~-]{1,256}$') {
+        throw "GOTHAM_ENROLL_TOKEN contains unexpected characters"
+    }
+    $binArgs += @("--enroll-token", $Token)
+}
+[Environment]::SetEnvironmentVariable("GOTHAM_ENROLL_TOKEN", $null, "Machine")
 
 Write-Host "[4/6] Registering boot Scheduled Task (SYSTEM, background, auto-restart)..."
 $action    = New-ScheduledTaskAction -Execute $Bin -Argument ($binArgs -join " ")

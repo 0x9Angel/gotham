@@ -46,6 +46,10 @@ fi
     echo "    (got '$OPERATOR')"
     exit 1
 }
+[[ "$PORT" =~ ^[0-9]{1,5}$ ]] && (( PORT >= 1 && PORT <= 65535 )) || {
+    echo "[!] GOTHAM_PORT must be a number from 1 to 65535 (got '$PORT')"
+    exit 1
+}
 echo "[1/7] Installing dependencies..."
 if command -v apt-get &>/dev/null; then
     export DEBIAN_FRONTEND=noninteractive
