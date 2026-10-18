@@ -1,6 +1,6 @@
 [package]
 name = "crypto-gotham-relay"
-version = "0.12.2"
+version = "0.12.3"
 edition = "2021"
 license = "AGPL-3.0-or-later OR LicenseRef-Gotham-Commercial"
 description = "Standalone Gotham mixnet relay daemon"
